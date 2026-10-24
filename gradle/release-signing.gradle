@@ -1,0 +1,62 @@
+// Shared local release signing. Credentials stay outside the source tree.
+def configuredPath = project.findProperty('releaseSigningProperties') ?:
+        System.getenv('ANDROID_RELEASE_SIGNING_PROPERTIES')
+def defaultDirectory = System.getenv('ProgramData')
+        ? new File(System.getenv('ProgramData'), 'AntiOblivionis/AndroidSigning')
+        : new File(System.getProperty('user.home'), '.config/AntiOblivionis/AndroidSigning')
+def signingFile = configuredPath ? project.file(configuredPath) : new File(defaultDirectory, 'signing.properties')
+def credentials = new Properties()
+if (signingFile.isFile()) signingFile.withInputStream { credentials.load(it) }
+def required = ['storeFile', 'storePassword', 'keyAlias', 'keyPassword']
+def ready = required.every { credentials.getProperty(it)?.trim() }
+def keyFile = ready ? new File(credentials.getProperty('storeFile')) : null
+if (keyFile != null && !keyFile.isAbsolute()) keyFile = new File(signingFile.parentFile, keyFile.path)
+def androidExtension = project.extensions.getByName('android')
+if (ready) {
+    def config = androidExtension.signingConfigs.create('sharedRelease') {
+        storeFile = keyFile
+        storeType = credentials.getProperty('storeType', 'PKCS12')
+        storePassword = credentials.getProperty('storePassword')
+        keyAlias = credentials.getProperty('keyAlias')
+        keyPassword = credentials.getProperty('keyPassword')
+        enableV1Signing = false
+        enableV2Signing = true
+        enableV3Signing = true
+        enableV4Signing = false
+    }
+    androidExtension.buildTypes.getByName('release').signingConfig = config
+} else {
+    androidExtension.buildTypes.getByName('release').signingConfig = null
+}
+
+def verifySigning = tasks.register('verifyReleaseSigning') {
+    group = 'verification'
+    description = 'Verify the external release key and the public certificate pin before packaging.'
+    doLast {
+        if (!ready || !signingFile.isFile()) {
+            throw new GradleException('Release signing is not configured. Set ANDROID_RELEASE_SIGNING_PROPERTIES '
+                    + 'or -PreleaseSigningProperties=<external signing.properties>. Debug signing is not used for releases.')
+        }
+        if (!keyFile.isFile()) throw new GradleException('The configured release keystore is unavailable.')
+        def store = java.security.KeyStore.getInstance(credentials.getProperty('storeType', 'PKCS12'))
+        keyFile.withInputStream { store.load(it, credentials.getProperty('storePassword').toCharArray()) }
+        def alias = credentials.getProperty('keyAlias')
+        if (!store.isKeyEntry(alias)) throw new GradleException('The configured release alias has no private key.')
+        def certificate = store.getCertificate(alias)
+        if (!(certificate instanceof java.security.cert.X509Certificate)) {
+            throw new GradleException('The release alias must use an X.509 certificate.')
+        }
+        certificate.checkValidity()
+        def fingerprint = java.security.MessageDigest.getInstance('SHA-256').digest(certificate.encoded).encodeHex().toString()
+        def pinFile = rootProject.file('signing/release-certificate.sha256')
+        if (pinFile.isFile() && fingerprint != pinFile.getText('UTF-8').trim().toLowerCase(java.util.Locale.ROOT)) {
+            throw new GradleException('Release signing certificate does not match this project\'s public certificate pin.')
+        }
+        logger.lifecycle('Release signing certificate SHA-256: ' + fingerprint)
+    }
+}
+tasks.configureEach { task ->
+    if (task.name ==~ /(?:validateSigning|package|sign|assemble|bundle).*Release(?:Bundle)?/) {
+        task.dependsOn(verifySigning)
+    }
+}

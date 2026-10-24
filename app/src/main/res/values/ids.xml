@@ -1,0 +1,7 @@
+<resources>
+    <item name="api_address" type="id" />
+    <item name="api_key" type="id" />
+    <item name="api_model" type="id" />
+    <item name="save_config" type="id" />
+    <item name="service_control" type="id" />
+</resources>

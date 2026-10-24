@@ -1,0 +1,37 @@
+.gradle/
+.kotlin/
+.idea/
+*.iml
+__pycache__/
+*.py[cod]
+**/build/
+local.properties
+research/
+artifacts/
+
+# Local credentials and private signing material.
+.env
+.env.*
+signing.properties
+keystore.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.key
+*.pem
+!signing/release-certificate.pem
+
+# Machine-specific deployment helpers are kept locally.
+scripts/website_ssh.py
+scripts/publish_website.py
+
+# Local website, internal notes and acceptance/deployment tools are not public app sources.
+/website/
+/docs/
+/probe/
+/scripts/
+/ACCEPTANCE.md
+/LLM_ACCEPTANCE.md
+/SERVICE_CONTROL.md
+/THREE_CHECKS.md
