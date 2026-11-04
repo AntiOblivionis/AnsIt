@@ -97,7 +97,8 @@ internal fun AnsItScreen(model: MainViewModel) {
     } else {
         AnsItContent(state, snackbar, model::edit, model::save, model::toggle, model::check,
             model::showGuide, model::dismissGuide, model::restartSystemUi, model::showAdjustment,
-            model::editSearch, model::saveSearch, model::cancelValidation, model::editTrigger, model::saveTrigger)
+            model::editSearch, model::saveSearch, model::cancelValidation, model::editTrigger, model::saveTrigger,
+            model::editTriggerSwap)
     }
 }
 
@@ -119,6 +120,7 @@ internal fun AnsItContent(
     onCancelValidation: () -> Unit = {},
     onTriggerEdit: (String) -> Unit = {},
     onTriggerSave: () -> Unit = {},
+    onTriggerSwap: (Boolean) -> Unit = {},
 ) {
     var confirmRestart by remember { mutableStateOf(false) }
     var showAbout by rememberSaveable { mutableStateOf(false) }
@@ -164,15 +166,18 @@ internal fun AnsItContent(
                     }
                 }
 
-                TriggerSettingsCard(state, onTriggerEdit, onTriggerSave)
+                TriggerSettingsCard(state, onTriggerEdit, onTriggerSave, onTriggerSwap)
                 ConfigurationCard(state, onEdit, onSave, onCancelValidation)
                 SearchConfigurationCard(state, onSearchEdit, onSearchSave, onCancelValidation)
 
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("长按状态栏，就能问", style = MaterialTheme.typography.titleMedium)
-                    Text("按住状态栏电池附近达到已保存阈值（" + state.triggerHoldMillis + " ms），感到轻振后松手。再次长按可取消解答或收起答案。无法识别电池布局时，请长按状态栏右侧。",
+                    Text("长按状态栏，连续答题", style = MaterialTheme.typography.titleMedium)
+                    Text("按住状态栏电池附近达到已保存阈值（" + state.triggerHoldMillis +
+                        " ms），感到轻振后松手即进入连续答题。单击电池：下一题（" +
+                        (if (state.triggerSavedSwap) "保留上下文" else "不保留上下文") + "）；双击电池：下一题（" +
+                        (if (state.triggerSavedSwap) "不保留上下文" else "保留上下文") + "）；再次长按退出。无法识别电池布局时，请长按状态栏右侧。",
                         style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text("关闭应用后，已启动的服务仍会运行；重启手机后需重新开始。",
+                    Text("上下文满后会提示“上下文已满”，单击可清除上下文继续，长按退出。关闭应用后，已启动的服务仍会运行；重启手机后需重新开始。",
                         style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
@@ -201,14 +206,15 @@ internal fun AnsItContent(
 }
 
 @Composable
-private fun TriggerSettingsCard(state: MainState, onEdit: (String) -> Unit, onSave: () -> Unit) {
+private fun TriggerSettingsCard(state: MainState, onEdit: (String) -> Unit, onSave: () -> Unit,
+                                onSwap: (Boolean) -> Unit) {
     val millis = state.triggerText.toIntOrNull()
     val valid = millis != null && millis in TriggerConfig.MIN_MS..TriggerConfig.MAX_MS
     val enabled = !state.triggerLoading && !state.triggerSaving
     Surface(shape = MaterialTheme.shapes.large, color = MaterialTheme.colorScheme.surfaceContainerLow) {
         Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("触发设置", style = MaterialTheme.typography.titleLarge)
-            Text("调整长按电池多久后判定。仅在服务运行且确认就绪时响应；停止后不接管长按。",
+            Text("调整长按电池多久后进入连续答题。仅在服务运行且确认就绪时响应；停止后不接管长按。",
                 style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             OutlinedTextField(state.triggerText, onEdit, enabled = enabled, singleLine = true,
                 label = { Text("触发阈值（毫秒）") }, supportingText = { Text("200–3000 ms，默认 650 ms") },
@@ -219,7 +225,16 @@ private fun TriggerSettingsCard(state: MainState, onEdit: (String) -> Unit, onSa
                 valueRange = TriggerConfig.MIN_MS.toFloat()..TriggerConfig.MAX_MS.toFloat(), steps = 55,
                 modifier = Modifier.testTag("trigger_slider"))
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(if (state.triggerDirty) "有未保存的更改" else "用于识屏与收起答案",
+                Column(Modifier.weight(1f)) {
+                    Text("交换单击/双击", style = MaterialTheme.typography.bodyLarge)
+                    Text(if (state.triggerSwap) "单击保留上下文，双击清除上下文" else "单击清除上下文，双击保留上下文",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Switch(checked = state.triggerSwap, onCheckedChange = onSwap, enabled = enabled,
+                    modifier = Modifier.testTag("swap_taps"))
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(if (state.triggerDirty) "有未保存的更改" else "长按进入，再次长按退出",
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.weight(1f))
                 TextButton(onClick = { onEdit(TriggerConfig.DEFAULT_MS.toString()) }, enabled = enabled,
@@ -230,7 +245,7 @@ private fun TriggerSettingsCard(state: MainState, onEdit: (String) -> Unit, onSa
                 if (state.triggerSaving) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                 else Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
-                Text(if (state.triggerSaving) "正在保存…" else "保存阈值")
+                Text(if (state.triggerSaving) "正在保存…" else "保存触发设置")
             }
             state.triggerNote?.let { Text(it, style = MaterialTheme.typography.bodySmall,
                 color = if (state.triggerError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary) }
@@ -270,7 +285,7 @@ private fun ServiceCard(state: MainState, onToggle: () -> Unit, onCheck: () -> U
                 Operation.START -> "正在从当前安装包启动服务…"
                 Operation.STOP -> "正在取消任务并停止服务…"
                 Operation.ADJUST -> "正在收起当前答案，进入调整模式…"
-                else -> if (running) "长按状态栏电池区域即可识屏，答案会直接显示在屏幕上。"
+                else -> if (running) "长按状态栏电池区域进入连续答题；单击/双击电池可继续。"
                     else "保存模型配置后，开启服务即可使用。"
             }, style = MaterialTheme.typography.bodyMedium)
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -326,7 +341,7 @@ private fun ConfigurationCard(state: MainState, onEdit: (ApiForm) -> Unit, onSav
         Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("模型配置", style = MaterialTheme.typography.titleLarge)
-                Text("使用支持图片输入的 OpenAI 兼容接口。每次识屏都是独立会话。",
+                Text("使用支持图片输入的 OpenAI 兼容接口。连续答题时，双击可保留上一轮上下文。",
                     style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             OutlinedTextField(form.address, { onEdit(form.copy(address = it)) }, modifier = Modifier.fillMaxWidth(),

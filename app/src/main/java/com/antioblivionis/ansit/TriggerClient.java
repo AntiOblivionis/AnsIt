@@ -16,6 +16,10 @@ final class TriggerClient {
     static void toggle(String instance) {
         if (TriggerProtocol.validInstance(instance)) request("TOGGLE " + instance);
     }
+    static void next(String instance, long modeToken, boolean doubleTap) {
+        if (!TriggerProtocol.validInstance(instance) || modeToken <= 0) return;
+        request(TriggerProtocol.next(instance, modeToken, doubleTap));
+    }
     private static String request(String command) {
         try (LocalSocket socket = new LocalSocket()) {
             socket.connect(new LocalSocketAddress(ServiceProtocol.CONTROL_SOCKET, LocalSocketAddress.Namespace.ABSTRACT));

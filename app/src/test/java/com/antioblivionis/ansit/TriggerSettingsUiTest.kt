@@ -64,6 +64,18 @@ class TriggerSettingsUiTest {
         compose.onNodeWithTag("save_trigger").performScrollTo().performClick()
         compose.runOnIdle { assertEquals(1, saves) }
     }
+    @Test fun swapSwitchOnlyEditsDraftUntilSaved() {
+        val state = mutableStateOf(MainState(triggerLoading = false))
+        var savedSwap = false
+        compose.setContent { AnsItTheme { AnsItContent(state.value,
+            onTriggerSwap = { state.value = state.value.copy(triggerSwap = it, triggerDirty = true) },
+            onTriggerSave = { savedSwap = state.value.triggerSwap }) } }
+        compose.onNodeWithTag("swap_taps").performScrollTo().performClick()
+        compose.runOnIdle { assertEquals(true, state.value.triggerSwap) }
+        compose.onNodeWithTag("save_trigger").performScrollTo().performClick()
+        compose.runOnIdle { assertEquals(true, savedSwap) }
+        render("trigger-swap")
+    }
     private fun render(name: String) {
         val directory = System.getProperty("ansit.renderDir") ?: return
         compose.runOnIdle {

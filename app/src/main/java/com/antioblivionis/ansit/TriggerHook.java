@@ -23,6 +23,10 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
     @Override public void initZygote(StartupParam startupParam) { loadedApk = startupParam.modulePath; }
     private final WeakHashMap<View, Gesture> gestures = new WeakHashMap<>();
     private final ExecutorService io = Executors.newSingleThreadExecutor();
+    // Readiness refreshes these before every tap is classified; the root validates them again.
+    private volatile String serviceInstance;
+    private volatile boolean continuous;
+    private volatile long modeToken;
     @Override public void handleLoadPackage(XC_LoadPackage.LoadPackageParam p) {
         if (!p.packageName.equals("com.android.systemui") || !p.processName.equals(p.packageName)) return;
         try {
@@ -60,7 +64,8 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
                 if (method.getName().equals("processPointerEvent") || method.getName().equals("onProcess"))
                     deoptimize.invoke(null, method);
             }
-        } catch (ReflectiveOperationException unavailable) {
+        } catch (Throwable unavailable) {
+            // Best effort only: this must never stop status installation or the hook itself.
             XposedBridge.log("AnsIt: pointer caller deoptimization unavailable (" + unavailable.getClass().getSimpleName() + ")");
         }
     }
@@ -71,14 +76,22 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
         final HoldState state = new HoldState();
         final TriggerGate gate = HookStatus.gate();
         boolean internalCancel;
+        boolean secondTap;
+        boolean moved;
+        boolean tapEligible;
+        boolean tapPending;
+        long firstTapUpAt;
+        float tapX, tapY;
         float x, y;
         final Runnable hold = this::onHold;
+        final Runnable singleTap = this::fireSingleTap;
         Gesture(View root) {
             this.root = root;
             root.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
                 @Override public void onViewAttachedToWindow(View v) { }
                 @Override public void onViewDetachedFromWindow(View v) {
-                    reset(); gestures.remove(v); v.removeOnAttachStateChangeListener(this);
+                    reset(); handler.removeCallbacks(singleTap); tapPending = false;
+                    gestures.remove(v); v.removeOnAttachStateChangeListener(this);
                 }
             });
         }
@@ -89,6 +102,8 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
         private void onHold() {
             HoldState.Attempt attempt = state.current();
             if (attempt == null) return;
+            moved = true;
+            secondTap = false;
             if (!StatusBarTarget.hit(root, x, y) || locked() || !gate.allowed(attempt.gateRevision, attempt.instance)) { reset(); return; }
             if (!state.requestConfirmation(attempt, SystemClock.uptimeMillis())) return;
             io.execute(() -> {
@@ -103,6 +118,10 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
                             MotionEvent.ACTION_CANCEL, x, y, 0);
                         internalCancel = true;
                         try { root.dispatchTouchEvent(cancel); }
+                        catch (Throwable failure) {
+                            // A vendor View must not take down SystemUI through this synthetic event.
+                            XposedBridge.log("AnsIt: synthetic cancel dispatch failed: " + failure.getClass().getSimpleName());
+                        }
                         finally { internalCancel = false; cancel.recycle(); }
                         HoldFeedback.signal(root);
                         return true;
@@ -111,17 +130,56 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
                 });
             });
         }
+        int slop() { return ViewConfiguration.get(root.getContext()).getScaledTouchSlop(); }
+        int doubleTapTimeout() { return ViewConfiguration.get(root.getContext()).getDoubleTapTimeout(); }
+        boolean secondTapCandidate(MotionEvent event) {
+            return tapPending && SystemClock.uptimeMillis() - firstTapUpAt <= doubleTapTimeout()
+                && Math.hypot(event.getX() - tapX, event.getY() - tapY) <= slop()
+                && !locked() && StatusBarTarget.hit(root, event.getX(), event.getY());
+        }
+        void scheduleSingleTap() {
+            tapPending = true;
+            firstTapUpAt = SystemClock.uptimeMillis();
+            tapX = x; tapY = y;
+            handler.removeCallbacks(singleTap);
+            handler.postDelayed(singleTap, doubleTapTimeout());
+        }
+        void fireSingleTap() {
+            tapPending = false;
+            sendNext(false);
+        }
+        void fireDoubleTap() {
+            sendNext(true);
+        }
+        void sendNext(boolean doubleTap) {
+            String instance = serviceInstance;
+            long token = modeToken;
+            if (continuous && instance != null && token > 0) io.execute(() -> TriggerClient.next(instance, token, doubleTap));
+        }
         boolean accept(MotionEvent event) {
             int action = event.getActionMasked();
             if (internalCancel) return false;
             if (action == MotionEvent.ACTION_DOWN) {
+                boolean second = secondTapCandidate(event);
                 reset();
+                moved = false;
+                if (second) {
+                    handler.removeCallbacks(singleTap);
+                    tapPending = false;
+                    secondTap = true;
+                }
                 if (locked() || !StatusBarTarget.hit(root, event.getX(), event.getY())) return false;
+                tapEligible = true;
                 x = event.getX(); y = event.getY();
                 HoldState.Attempt attempt = state.begin(event.getDownTime(), gate.revision());
                 io.execute(() -> {
-                    if (!attempt.valid) return;
+                    // Refresh readiness even when the finger left early: taps still need the mode token.
                     TriggerProtocol.Ready ready = TriggerClient.prepare();
+                    if (ready != null) {
+                        serviceInstance = ready.instance();
+                        continuous = ready.mode();
+                        modeToken = ready.modeToken();
+                    }
                     handler.post(() -> {
                         if (!state.live(attempt)) return;
                         if (ready == null || !root.isShown() || locked()
@@ -134,19 +192,36 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
                 return false;
             }
             if (!state.fired() && (action == MotionEvent.ACTION_MOVE || action == MotionEvent.ACTION_POINTER_DOWN)) {
-                int slop = ViewConfiguration.get(root.getContext()).getScaledTouchSlop();
-                if (event.getPointerCount() != 1 || Math.hypot(event.getX() - x, event.getY() - y) > slop) reset();
+                if (event.getPointerCount() != 1 || Math.hypot(event.getX() - x, event.getY() - y) > slop()) {
+                    moved = true;
+                    reset();
+                }
             }
             boolean consume = state.fired();
             if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
                 HoldState.Release release = state.release(action == MotionEvent.ACTION_UP);
                 handler.removeCallbacks(hold);
-                if (release.instance() != null) io.execute(() -> {
-                    if (gate.allowed(release.gateRevision(), release.instance())) TriggerClient.toggle(release.instance());
-                });
+                if (release.instance() != null) {
+                    secondTap = false;
+                    io.execute(() -> {
+                        if (gate.allowed(release.gateRevision(), release.instance())) TriggerClient.toggle(release.instance());
+                    });
+                } else if (action == MotionEvent.ACTION_UP && tapEligible && !moved) {
+                    if (secondTap) {
+                        secondTap = false;
+                        fireDoubleTap();
+                    } else {
+                        scheduleSingleTap();
+                    }
+                }
             }
             return consume;
         }
-        void reset() { handler.removeCallbacks(hold); state.cancel(); }
+        void reset() {
+            handler.removeCallbacks(hold);
+            state.cancel();
+            secondTap = false;
+            tapEligible = false;
+        }
     }
 }

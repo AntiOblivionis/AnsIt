@@ -13,10 +13,10 @@ import java.util.concurrent.TimeUnit;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-/** One task per capture; only that task's tool messages are carried between requests. */
+/** One turn per capture; a continuous session may carry the caller's prior turns into the request. */
 final class LlmCall {
-    static final String SYSTEM_PROMPT = """
-        你是中文识屏解答助手。每次识屏都是全新、独立的任务，不假设存在任何历史对话。
+    private static final String ROLE = "你是中文识屏解答助手。";
+    private static final String RULES = """
         先准确辨认本次截图中的主要题目、问题或用户正在处理的内容，再给出答案。题目优先于状态栏、导航栏、广告和无关界面。
         选择题先给题号与选项字母及答案；计算题先给结果，再给必要的简短步骤；多题按画面顺序编号。
         核对题干中的否定词、单位、条件、公式和图中标注。截图不完整、文字不清或条件不足时，明确指出缺失部分，不猜测、不编造。
@@ -25,6 +25,14 @@ final class LlmCall {
         使用简体中文纯文本，保留必要的外语、公式和代码。答案直接、准确，尽量控制在 500 个汉字以内。
         不使用 Markdown 表格、标题标记或代码围栏，不复述大段题干，不声称做了实际未进行的联网搜索或操作。
         """;
+    static final String SYSTEM_PROMPT = ROLE + "每次识屏都是全新、独立的任务，不假设存在任何历史对话。\n" + RULES;
+    static final String CONTINUOUS_SYSTEM_PROMPT = ROLE
+        + "这是一次连续答题会话：上文的截图与答案是此前题目，本次截图是下一题。结合上文作答；若与上文无关则独立作答；不要重复上文内容。\n"
+        + RULES;
+    private static final String FRESH_QUESTION = "请解答当前截图中的主要问题，直接给出答案和必要说明。";
+    private static final String FRESH_QUESTION_SEARCH = "请解答当前截图中的主要问题；有必要时可使用已提供的搜索工具核对事实。";
+    private static final String NEXT_QUESTION = "这是连续答题会话的下一题。请结合上文解答本次截图中的主要问题；若与上文无关则独立作答。";
+    private static final String NEXT_QUESTION_SEARCH = "这是连续答题会话的下一题。请结合上文解答本次截图中的主要问题；若与上文无关则独立作答；有必要时可使用已提供的搜索工具核对事实。";
     private static final String SEARCH_PROMPT = """
         可按需调用 web_search 核对最新信息、政策、事实或缺少依据的知识；能直接计算和推理时不必搜索。
         每次任务最多搜索三次。仅发送解决本题必需的关键词，不发送完整截图、账号、密钥、验证码等敏感内容。
@@ -45,19 +53,37 @@ final class LlmCall {
     String answer(ApiConfig config, Bitmap bitmap) throws Exception { return answer(config, SearchConfig.disabled(), bitmap); }
     String answer(ApiConfig config, SearchConfig search, Bitmap bitmap) throws Exception {
         check();
+        return answerImage(config, encodePng(bitmap), search.enabled ? new DeepSeekSearch(this, search.key) : null);
+    }
+    String answer(ApiConfig config, SearchConfig search, Bitmap bitmap, java.util.List<JSONObject> history) throws Exception {
+        check();
+        return answerImage(config, encodePng(bitmap), search.enabled ? new DeepSeekSearch(this, search.key) : null, history);
+    }
+    String answer(ApiConfig config, SearchConfig search, String base64Png, java.util.List<JSONObject> history) throws Exception {
+        check();
+        return answerImage(config, base64Png, search.enabled ? new DeepSeekSearch(this, search.key) : null, history);
+    }
+    static String encodePng(Bitmap bitmap) throws Failure {
         ByteArrayOutputStream png = new ByteArrayOutputStream();
         if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, png)) throw new Failure("图像编码失败");
-        return answerImage(config, Base64.encodeToString(png.toByteArray(), Base64.NO_WRAP),
-            search.enabled ? new DeepSeekSearch(this, search.key) : null);
+        return Base64.encodeToString(png.toByteArray(), Base64.NO_WRAP);
     }
-    String answerImage(ApiConfig config, String base64Png) throws Exception { return answerImage(config, base64Png, null); }
+    String answerImage(ApiConfig config, String base64Png) throws Exception {
+        return answerImage(config, base64Png, null, java.util.Collections.emptyList());
+    }
     String answerImage(ApiConfig config, String base64Png, DeepSeekSearch search) throws Exception {
+        return answerImage(config, base64Png, search, java.util.Collections.emptyList());
+    }
+    String answerImage(ApiConfig config, String base64Png, DeepSeekSearch search, java.util.List<JSONObject> history) throws Exception {
         check(); deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(120);
+        boolean continued = history != null && !history.isEmpty();
         JSONArray messages = new JSONArray()
-            .put(new JSONObject().put("role", "system").put("content", SYSTEM_PROMPT + (search != null ? SEARCH_PROMPT : "")))
-            .put(imageMessage(base64Png, search == null
-                ? "请解答当前截图中的主要问题，直接给出答案和必要说明。"
-                : "请解答当前截图中的主要问题；有必要时可使用已提供的搜索工具核对事实。"));
+            .put(new JSONObject().put("role", "system").put("content",
+                (continued ? CONTINUOUS_SYSTEM_PROMPT : SYSTEM_PROMPT) + (search != null ? SEARCH_PROMPT : "")));
+        if (history != null) for (JSONObject message : history) messages.put(message);
+        messages.put(imageMessage(base64Png, search == null
+            ? (continued ? NEXT_QUESTION : FRESH_QUESTION)
+            : (continued ? NEXT_QUESTION_SEARCH : FRESH_QUESTION_SEARCH)));
         int searches = 0;
         boolean searchFailed = false;
         for (int round = 0; round < MAX_ROUNDS; round++) {
@@ -150,11 +176,14 @@ final class LlmCall {
     private static JSONObject base(ApiConfig config, JSONArray messages) throws Exception {
         return new JSONObject().put("model", config.model).put("stream", false).put("messages", messages);
     }
-    private static JSONObject imageMessage(String png, String prompt) throws Exception {
+    static JSONObject imageMessage(String png, String prompt) throws Exception {
         return new JSONObject().put("role", "user").put("content", new JSONArray()
             .put(new JSONObject().put("type", "text").put("text", prompt))
             .put(new JSONObject().put("type", "image_url").put("image_url",
                 new JSONObject().put("url", "data:image/png;base64," + png).put("detail", "high"))));
+    }
+    static JSONObject assistantMessage(String text) throws Exception {
+        return new JSONObject().put("role", "assistant").put("content", text);
     }
     private static JSONObject assistant(JSONObject original, JSONArray calls) throws Exception {
         JSONObject value = new JSONObject().put("role", "assistant").put("content", original.opt("content")).put("tool_calls", calls);
@@ -198,12 +227,15 @@ final class LlmCall {
             byte[] body = request.toString().getBytes(StandardCharsets.UTF_8); current.setFixedLengthStreamingMode(body.length);
             try (var out = current.getOutputStream()) { check(); out.write(body); }
             check(); int status = current.getResponseCode();
-            if (status < 200 || status >= 300) throw new Failure(target + switch (status) {
-                case 401, 403 -> "认证或访问失败，请检查对应的 API Key 和权限（HTTP " + status + "）";
-                case 402 -> "余额不足（HTTP 402）";
-                case 429 -> "限流或额度不足（HTTP 429）";
-                default -> "请求失败（HTTP " + status + "），请检查地址、模型及其图片/工具能力";
-            });
+            if (status < 200 || status >= 300) {
+                if (!search && contextLimit(status, errorBody(current))) throw new ContextFull();
+                throw new Failure(target + switch (status) {
+                    case 401, 403 -> "认证或访问失败，请检查对应的 API Key 和权限（HTTP " + status + "）";
+                    case 402 -> "余额不足（HTTP 402）";
+                    case 429 -> "限流或额度不足（HTTP 429）";
+                    default -> "请求失败（HTTP " + status + "），请检查地址、模型及其图片/工具能力";
+                });
+            }
             byte[] response;
             try (InputStream in = current.getInputStream(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
                 byte[] block = new byte[8192]; int count;
@@ -219,5 +251,26 @@ final class LlmCall {
         catch (org.json.JSONException invalid) { throw new Failure(target + "返回格式异常"); }
         finally { connection = null; current.disconnect(); }
     }
-    static final class Failure extends Exception { Failure(String message) { super(message); } }
+    private static String errorBody(HttpURLConnection connection) {
+        try (java.io.InputStream error = connection.getErrorStream()) {
+            if (error == null) return "";
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] block = new byte[4096];
+            int count;
+            while (out.size() < 32_768 && (count = error.read(block)) != -1)
+                out.write(block, 0, Math.min(count, 32_768 - out.size()));
+            return new String(out.toByteArray(), StandardCharsets.UTF_8);
+        } catch (java.io.IOException unavailable) { return ""; }
+    }
+    private static boolean contextLimit(int status, String body) {
+        if (status == 413) return true;
+        String value = body.toLowerCase(java.util.Locale.ROOT);
+        return value.contains("context length") || value.contains("context_length")
+            || value.contains("maximum context") || value.contains("context window")
+            || value.contains("too many tokens") || value.contains("prompt is too long")
+            || value.contains("maximum number of tokens") || value.contains("request too large")
+            || value.contains("input is too long") || value.contains("payload too large");
+    }
+    static class Failure extends Exception { Failure(String message) { super(message); } }
+    static final class ContextFull extends Failure { ContextFull() { super("上下文已满"); } }
 }

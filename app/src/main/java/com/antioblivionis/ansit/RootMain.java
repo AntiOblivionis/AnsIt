@@ -20,6 +20,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.Collections;
+import java.util.List;
+import org.json.JSONObject;
 
 /** Executed by app_process as root, never inside a target application's process. */
 public final class RootMain {
@@ -42,6 +45,9 @@ public final class RootMain {
     private static DisplayState displayedOn;
     private static String lastMonitorError;
     private static final java.util.concurrent.atomic.AtomicReference<String> nextTriggerDump = new java.util.concurrent.atomic.AtomicReference<>();
+    private static final AnswerConversation conversation = new AnswerConversation();
+    private static long modeToken;
+    private static long modeSerial;
     private record DisplayState(int width, int height, int rotation, int state, int layerStack, long physicalId, boolean locked) { }
 
     public static void main(String[] args) throws Exception {
@@ -114,6 +120,8 @@ public final class RootMain {
             return;
         }
         serviceApk = BuildIdentity.digest(System.getenv("CLASSPATH"));
+        // Android 15 text layout consults currentApplication even in app_process.
+        call(Class.forName("android.app.ActivityThread"), "systemMain", new Class<?>[0]);
         call(android.graphics.Typeface.class, "loadPreinstalledSystemFontMap", new Class<?>[0]);
         systemUiUid = resolveSystemUiUid();
         monitor.scheduleWithFixedDelay(() -> {
@@ -164,14 +172,23 @@ public final class RootMain {
                     } else if (TriggerProtocol.PREPARE.equals(cmd)) {
                         String reply = TriggerProtocol.UNAVAILABLE;
                         try {
-                            if (triggerReady()) reply = TriggerProtocol.ready(serviceInstance,
-                                TriggerConfig.read(new java.io.File(CONFIG_DIR, TriggerConfig.FILE_NAME)).holdMillis);
+                            if (triggerReady()) {
+                                int holdMillis = TriggerConfig.read(new java.io.File(CONFIG_DIR, TriggerConfig.FILE_NAME)).holdMillis;
+                                synchronized (RootMain.class) {
+                                    reply = TriggerProtocol.ready(serviceInstance, holdMillis, active, active ? modeToken : 0);
+                                }
+                            }
                         } catch (Exception invalidSettings) { }
                         client.getOutputStream().write((reply + "\n").getBytes(StandardCharsets.UTF_8));
                     } else if (cmd != null && cmd.startsWith("TRIGGER_CHECK ")) {
                         String reply = TriggerProtocol.current(cmd, "TRIGGER_CHECK ", serviceInstance) && triggerReady()
                             ? TriggerProtocol.confirmed(serviceInstance) : TriggerProtocol.UNAVAILABLE;
                         client.getOutputStream().write((reply + "\n").getBytes(StandardCharsets.UTF_8));
+                    } else if (cmd != null && cmd.startsWith(TriggerProtocol.NEXT + " ")) {
+                        TriggerProtocol.Next next = TriggerProtocol.parseNext(cmd);
+                        boolean accepted = next != null && next.instance().equals(serviceInstance)
+                            && nextTurn(next.doubleTap(), next.modeToken());
+                        client.getOutputStream().write((accepted ? "OK\n" : "IGNORED\n").getBytes(StandardCharsets.UTF_8));
                     } else if ("TOGGLE".equals(cmd) || (cmd != null && cmd.startsWith("TOGGLE "))) {
                         boolean accepted = !stopping && ("TOGGLE".equals(cmd) || TriggerProtocol.current(cmd, "TOGGLE ", serviceInstance));
                         if (accepted) toggle();
@@ -183,7 +200,8 @@ public final class RootMain {
                         cancel(); client.getOutputStream().write("OK\n".getBytes(StandardCharsets.UTF_8));
                     } else if (uid == 0 && "STATUS".equals(cmd)) {
                         synchronized (RootMain.class) {
-                            client.getOutputStream().write(("active="+active+" layer="+(layer != null)+" generation="+generation.get()+"\n").getBytes(StandardCharsets.UTF_8));
+                            client.getOutputStream().write(("active="+active+" mode="+modeToken+" full="+conversation.full()
+                                +" layer="+(layer != null)+" generation="+generation.get()+"\n").getBytes(StandardCharsets.UTF_8));
                         }
                     } else if (uid == 0 && "RELAYOUT".equals(cmd)) {
                         synchronized (RootMain.class) {
@@ -323,7 +341,6 @@ public final class RootMain {
         }
         if (!stopped) throw new IllegalStateException("Previous service did not stop");
         String nonce = java.util.UUID.randomUUID().toString();
-        try (var file = new java.io.FileOutputStream(log)) { android.system.Os.chmod(log.getPath(), 0600); }
         ProcessBuilder builder = new ProcessBuilder("/system/bin/nohup", "/system/bin/app_process", "/system/bin", "--nice-name=ansit-root", "com.antioblivionis.ansit.RootMain", "serve", nonce);
         builder.environment().put("CLASSPATH", apk);
         builder.redirectInput(ProcessBuilder.Redirect.from(new java.io.File("/dev/null")));
@@ -343,7 +360,8 @@ public final class RootMain {
     }
 
     private static synchronized void cancel() {
-        generation.incrementAndGet(); active = false;
+        generation.incrementAndGet(); active = false; modeToken = 0;
+        conversation.reset();
         if (pendingCall != null) { pendingCall.cancel(); pendingCall = null; }
         if (pendingTask != null) { pendingTask.cancel(true); pendingTask = null; }
         hide();
@@ -366,6 +384,38 @@ public final class RootMain {
             if (displayedOn.locked || displayedOn.state != 2) return;
         } catch (Exception e) { e.printStackTrace(); return; }
         active = true;
+        modeToken = ++modeSerial;
+        conversation.reset();
+        runTurn(request, false);
+        System.out.println("MODE " + modeToken + " " + request);
+    }
+
+    /** A tap on the battery area advances the active continuous session. */
+    private static synchronized boolean nextTurn(boolean doubleTap, long expectedModeToken) {
+        if (!active || stopping || expectedModeToken != modeToken) return false;
+        if (pendingTask != null) return false; // Ignore taps while this turn is still in flight.
+        TriggerConfig config;
+        try {
+            if (!triggerReady()) return false;
+            config = TriggerConfig.read(new java.io.File(CONFIG_DIR, TriggerConfig.FILE_NAME));
+        } catch (Exception unavailable) { return false; }
+        boolean keepContext = config.swapTaps ? !doubleTap : doubleTap;
+        if (keepContext && (conversation.full() || conversation.limitReached())) {
+            conversation.markFull();
+            try {
+                show("上下文已满", displayedOn.width, displayedOn.height);
+                System.out.println("CONTEXT_FULL " + modeToken);
+            } catch (Exception drawing) { cancel(); }
+            return true;
+        }
+        long request = generation.incrementAndGet();
+        if (!keepContext) conversation.reset();
+        runTurn(request, keepContext);
+        System.out.println("NEXT " + (keepContext ? "context " : "fresh ") + request);
+        return true;
+    }
+
+    private static void runTurn(long request, boolean keepContext) {
         LlmCall api = new LlmCall(); pendingCall = api;
         pendingTask = worker.submit(() -> {
             Bitmap bitmap = null;
@@ -376,6 +426,7 @@ public final class RootMain {
                 catch (Exception invalidSearch) { search = SearchConfig.disabled(); }
                 synchronized (RootMain.class) { if (!active || generation.get() != request) return; }
                 bitmap = capture();
+                String base64 = LlmCall.encodePng(bitmap);
                 String diagnostic = nextTriggerDump.getAndSet(null);
                 if (diagnostic != null) {
                     java.io.File file = new java.io.File("/data/local/tmp/ansit-trigger-"+diagnostic+".png");
@@ -383,16 +434,29 @@ public final class RootMain {
                     android.system.Os.chmod(file.getPath(), 0600);
                     System.out.println("TRIGGER_FRAME " + request + " " + diagnostic);
                 }
+                List<JSONObject> history;
                 synchronized (RootMain.class) {
                     if (!active || generation.get() != request) return;
                     show("正在解答…", bitmap.getWidth(), bitmap.getHeight());
-                    System.out.println("REQUEST " + request);
+                    history = keepContext ? conversation.snapshot() : Collections.emptyList();
+                    System.out.println("REQUEST " + request + (keepContext ? " context" : " fresh"));
                 }
-                String result = api.answer(config, search, bitmap);
+                String result = api.answer(config, search, base64, history);
                 synchronized (RootMain.class) {
                     if (active && generation.get() == request) {
+                        conversation.append(base64, result);
                         show(result, bitmap.getWidth(), bitmap.getHeight());
                         System.out.println("SHOWN " + request);
+                    }
+                }
+            } catch (LlmCall.ContextFull full) {
+                synchronized (RootMain.class) {
+                    if (active && generation.get() == request) {
+                        conversation.markFull();
+                        try {
+                            show("上下文已满", displayedOn.width, displayedOn.height);
+                            System.out.println("CONTEXT_FULL " + request);
+                        } catch (Exception drawing) { cancel(); }
                     }
                 }
             } catch (java.util.concurrent.CancellationException ignored) {
@@ -401,7 +465,7 @@ public final class RootMain {
                     if (active && generation.get() == request) {
                         String message = t instanceof ApiConfig.Invalid || t instanceof LlmCall.Failure ? t.getMessage() : "识屏或请求失败，请重试";
                         try { show(message, displayedOn.width, displayedOn.height); System.out.println("ERROR " + request); }
-                        catch (Exception drawing) { active = false; hide(); }
+                        catch (Exception drawing) { cancel(); }
                     }
                 }
             } finally {

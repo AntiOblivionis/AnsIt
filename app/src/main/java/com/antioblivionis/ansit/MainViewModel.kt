@@ -52,6 +52,8 @@ internal data class MainState(
     val triggerLoading: Boolean = true,
     val triggerSaving: Boolean = false,
     val triggerDirty: Boolean = false,
+    val triggerSwap: Boolean = false,
+    val triggerSavedSwap: Boolean = false,
     val triggerNote: String? = null,
     val triggerError: Boolean = false,
 ) {
@@ -107,8 +109,9 @@ internal class MainViewModel(application: Application) : AndroidViewModel(applic
             val trigger = withContext(Dispatchers.IO) { try { TriggerConfig.read(triggerFile) } catch (_: Exception) { null } }
             mutable.update {
                 it.copy(triggerText = (trigger?.holdMillis ?: TriggerConfig.DEFAULT_MS).toString(),
-                    triggerHoldMillis = trigger?.holdMillis ?: TriggerConfig.DEFAULT_MS, triggerLoading = false,
-                    triggerDirty = trigger == null, triggerError = trigger == null,
+                    triggerHoldMillis = trigger?.holdMillis ?: TriggerConfig.DEFAULT_MS,
+                    triggerSwap = trigger?.swapTaps ?: false, triggerSavedSwap = trigger?.swapTaps ?: false,
+                    triggerLoading = false, triggerDirty = trigger == null, triggerError = trigger == null,
                     triggerNote = if (trigger == null) "触发设置读取失败，请重新保存" else null)
             }
         }
@@ -119,7 +122,13 @@ internal class MainViewModel(application: Application) : AndroidViewModel(applic
         mutable.update { it.copy(search = form, searchDirty = form != savedSearch, searchCheck = null, searchCheckPassed = null) }
     }
     fun editTrigger(value: String) {
-        mutable.update { it.copy(triggerText = value, triggerDirty = value.toIntOrNull() != it.triggerHoldMillis,
+        mutable.update { it.copy(triggerText = value,
+            triggerDirty = value.toIntOrNull() != it.triggerHoldMillis || it.triggerSwap != it.triggerSavedSwap,
+            triggerNote = null, triggerError = false) }
+    }
+    fun editTriggerSwap(value: Boolean) {
+        mutable.update { it.copy(triggerSwap = value,
+            triggerDirty = it.triggerText.toIntOrNull() != it.triggerHoldMillis || value != it.triggerSavedSwap,
             triggerNote = null, triggerError = false) }
     }
     fun saveTrigger() {
@@ -132,9 +141,11 @@ internal class MainViewModel(application: Application) : AndroidViewModel(applic
         mutable.update { it.copy(triggerSaving = true, triggerNote = null, triggerError = false) }
         viewModelScope.launch {
             try {
-                withContext(Dispatchers.IO) { PrivateSettings.write(triggerFile, TriggerConfig(millis).json()) }
-                val message = "已保存，从下一次长按使用 $millis ms"
-                mutable.update { it.copy(triggerText = millis.toString(), triggerHoldMillis = millis, triggerDirty = false, triggerNote = message) }
+                val swap = state.value.triggerSwap
+                withContext(Dispatchers.IO) { PrivateSettings.write(triggerFile, TriggerConfig(millis, swap).json()) }
+                val message = "已保存，从下一次长按开始使用新设置"
+                mutable.update { it.copy(triggerText = millis.toString(), triggerHoldMillis = millis,
+                    triggerSavedSwap = swap, triggerDirty = false, triggerNote = message) }
                 notices.send(UiNotice(message, saved = true))
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (_: Exception) { mutable.update { it.copy(triggerNote = "未能确认触发设置保存，请重试", triggerError = true) } }
