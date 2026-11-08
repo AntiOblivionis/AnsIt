@@ -7,6 +7,9 @@ import android.os.SystemClock;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
+import java.lang.reflect.Method;
+import java.util.Collections;
+import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -22,52 +25,134 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
     private String loadedApk;
     @Override public void initZygote(StartupParam startupParam) { loadedApk = startupParam.modulePath; }
     private final WeakHashMap<View, Gesture> gestures = new WeakHashMap<>();
+    private final Set<View> pendingAttach = Collections.newSetFromMap(new WeakHashMap<>());
+    private final Set<View> attachedSources = Collections.newSetFromMap(new WeakHashMap<>());
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     // Readiness refreshes these before every tap is classified; the root validates them again.
     private volatile String serviceInstance;
     private volatile boolean continuous;
     private volatile long modeToken;
+    private static volatile long lastFiredDownTime = Long.MIN_VALUE;
     @Override public void handleLoadPackage(XC_LoadPackage.LoadPackageParam p) {
         if (!p.packageName.equals("com.android.systemui") || !p.processName.equals(p.packageName)) return;
         try {
-            // ViewRootImpl dispatches each window's pointer event here before vendor View overrides.
-            // Resolve the non-SDK entry through LSPosed; this never runs in the ordinary app.
-            XposedHelpers.findAndHookMethod(View.class, "dispatchPointerEvent", MotionEvent.class, new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam param) {
-                    View root = (View) param.thisObject;
-                    Gesture g = gestures.get(root);
-                    if (!StatusBarTarget.isStatusBarWindow(root)) {
-                        if (g != null) g.reset();
-                        return;
-                    }
-                    MotionEvent event = (MotionEvent) param.args[0];
-                    if (g == null) {
-                        if (event.getActionMasked() != MotionEvent.ACTION_DOWN) return;
-                        g = new Gesture(root); gestures.put(root, g);
-                    }
-                    if (g.accept(event)) param.setResult(true);
-                }
-            });
-            deoptimizePointerCaller(p.classLoader);
-            XposedBridge.log("AnsIt: framework status bar trigger installed");
+            if (!installStatusBarTouch(p.classLoader)) {
+                XposedBridge.log("AnsIt: no supported status bar view");
+                return;
+            }
+            XposedBridge.log("AnsIt: status bar touch trigger installed");
             HookStatus.start(loadedApk);
         } catch (Throwable t) { XposedBridge.log(t); }
     }
 
-    private static void deoptimizePointerCaller(ClassLoader loader) {
-        try {
-            // ART may inline the final View entry into its framework caller. LSPosed exposes
-            // this extension even when modules compile against the legacy Xposed API.
-            var deoptimize = XposedBridge.class.getMethod("deoptimizeMethod", java.lang.reflect.Member.class);
-            Class<?> stage = Class.forName("android.view.ViewRootImpl$ViewPostImeInputStage", false, loader);
-            for (var method : stage.getDeclaredMethods()) {
-                if (method.getName().equals("processPointerEvent") || method.getName().equals("onProcess"))
-                    deoptimize.invoke(null, method);
+    /**
+     * HyperOS/HyperCeiler and AOSP both expose a status bar view that is inflated once per window:
+     * MiuiPhoneStatusBarView (HyperOS) and PhoneStatusBarView (AOSP). Hooking their lifecycle
+     * gives us a real View to listen on, with no final framework entry or deoptimization involved.
+     * HyperCeiler uses the same onFinishInflate pattern for its status-bar gestures.
+     */
+    private boolean installStatusBarTouch(ClassLoader loader) {
+        String[] views = {
+            "com.android.systemui.statusbar.phone.MiuiPhoneStatusBarView",
+            "com.android.systemui.statusbar.phone.PhoneStatusBarView"
+        };
+        for (String name : views) {
+            Class<?> type = XposedHelpers.findClassIfExists(name, loader);
+            if (type == null) continue;
+            try {
+                boolean hooked = false;
+                for (String methodName : new String[]{"onFinishInflate", "onAttachedToWindow"}) {
+                    Method method = findMethod(type, methodName);
+                    if (method == null) continue;
+                    XposedBridge.hookMethod(method, new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam param) {
+                            if (param.thisObject instanceof View view) attachStatusBarTouch(view);
+                        }
+                    });
+                    hooked = true;
+                }
+                if (!hooked) continue;
+                XposedBridge.log("AnsIt: status bar touch target " + name);
+                return true;
+            } catch (Throwable unavailable) {
+                XposedBridge.log("AnsIt: touch hook unavailable on " + name + " ("
+                        + unavailable.getClass().getSimpleName() + ")");
             }
-        } catch (Throwable unavailable) {
-            // Best effort only: this must never stop status installation or the hook itself.
-            XposedBridge.log("AnsIt: pointer caller deoptimization unavailable (" + unavailable.getClass().getSimpleName() + ")");
         }
+        String[] roots = {
+            "com.android.systemui.statusbar.window.StatusBarWindowView",
+            "com.android.systemui.statusbar.phone.StatusBarWindowView"
+        };
+        for (String name : roots) {
+            Class<?> type = XposedHelpers.findClassIfExists(name, loader);
+            if (type == null) continue;
+            try {
+                Method attached = findMethod(type, "onAttachedToWindow");
+                if (attached == null) continue;
+                XposedBridge.hookMethod(attached, new XC_MethodHook() {
+                    @Override protected void afterHookedMethod(MethodHookParam param) {
+                        if (param.thisObject instanceof View view) attachStatusBarTouch(view);
+                    }
+                });
+                XposedBridge.log("AnsIt: status bar root touch target " + name);
+                return true;
+            } catch (Throwable unavailable) {
+                XposedBridge.log("AnsIt: root touch hook unavailable on " + name + " ("
+                        + unavailable.getClass().getSimpleName() + ")");
+            }
+        }
+        return false;
+    }
+
+    private static Method findMethod(Class<?> type, String name, Class<?>... parameters) {
+        for (Class<?> current = type; current != null && current != View.class; current = current.getSuperclass()) {
+            try { return current.getDeclaredMethod(name, parameters); }
+            catch (NoSuchMethodException ignored) { }
+        }
+        return null;
+    }
+
+    private void attachStatusBarTouch(View source) {
+        if (attachedSources.contains(source)) return;
+        View root = source.getRootView();
+        if (!StatusBarTarget.isStatusBarWindow(root)) {
+            // onFinishInflate can run before the window's LayoutParams are visible. Retry once when
+            // the view is attached instead of silently keeping the legacy fragile hook.
+            if (pendingAttach.add(source)) {
+                source.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+                    @Override public void onViewAttachedToWindow(View v) {
+                        v.removeOnAttachStateChangeListener(this);
+                        pendingAttach.remove(v);
+                        attachStatusBarTouch(v);
+                    }
+                    @Override public void onViewDetachedFromWindow(View v) {
+                        v.removeOnAttachStateChangeListener(this);
+                        pendingAttach.remove(v);
+                    }
+                });
+            }
+            return;
+        }
+        source.setOnTouchListener((view, event) -> {
+            Gesture gesture = gestures.get(root);
+            if (gesture == null) {
+                if (event.getActionMasked() != MotionEvent.ACTION_DOWN) return false;
+                gesture = new Gesture(root);
+                gestures.put(root, gesture);
+            }
+            if (source == root) return gesture.accept(event);
+            // Listener coordinates are relative to the status bar view; the gesture target works in
+            // status-bar-window coordinates. Move a copy so the original SystemUI event is untouched.
+            int[] from = new int[2], to = new int[2];
+            source.getLocationOnScreen(from);
+            root.getLocationOnScreen(to);
+            MotionEvent copy = MotionEvent.obtain(event);
+            copy.offsetLocation(from[0] - to[0], from[1] - to[1]);
+            try { return gesture.accept(copy); }
+            finally { copy.recycle(); }
+        });
+        XposedBridge.log("AnsIt: status bar touch attached to " + source.getClass().getName());
+        attachedSources.add(source);
     }
 
     private final class Gesture {
@@ -75,7 +160,6 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
         final Handler handler = new Handler(Looper.getMainLooper());
         final HoldState state = new HoldState();
         final TriggerGate gate = HookStatus.gate();
-        boolean internalCancel;
         boolean secondTap;
         boolean moved;
         boolean tapEligible;
@@ -114,15 +198,6 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
                     if (!ready || !StatusBarTarget.hit(root, x, y) || locked()) { reset(); return; }
                     boolean accepted = gate.runIfAllowed(attempt.gateRevision, attempt.instance, () -> {
                         if (!state.confirm(attempt, attempt.instance)) return false;
-                        MotionEvent cancel = MotionEvent.obtain(attempt.startedAt, SystemClock.uptimeMillis(),
-                            MotionEvent.ACTION_CANCEL, x, y, 0);
-                        internalCancel = true;
-                        try { root.dispatchTouchEvent(cancel); }
-                        catch (Throwable failure) {
-                            // A vendor View must not take down SystemUI through this synthetic event.
-                            XposedBridge.log("AnsIt: synthetic cancel dispatch failed: " + failure.getClass().getSimpleName());
-                        }
-                        finally { internalCancel = false; cancel.recycle(); }
                         HoldFeedback.signal(root);
                         return true;
                     });
@@ -158,8 +233,10 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
         }
         boolean accept(MotionEvent event) {
             int action = event.getActionMasked();
-            if (internalCancel) return false;
             if (action == MotionEvent.ACTION_DOWN) {
+                // A duplicated delivery of the same touch (two status bar view instances or a relayed
+                // event) must not start a second session and immediately toggle the first one off.
+                if (event.getDownTime() == lastFiredDownTime) return true;
                 boolean second = secondTapCandidate(event);
                 reset();
                 moved = false;
@@ -202,6 +279,7 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
                 HoldState.Release release = state.release(action == MotionEvent.ACTION_UP);
                 handler.removeCallbacks(hold);
                 if (release.instance() != null) {
+                    lastFiredDownTime = event.getDownTime();
                     secondTap = false;
                     io.execute(() -> {
                         if (gate.allowed(release.gateRevision(), release.instance())) TriggerClient.toggle(release.instance());

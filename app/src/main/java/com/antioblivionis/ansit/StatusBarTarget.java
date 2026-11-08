@@ -36,7 +36,7 @@ final class StatusBarTarget {
             target.inset(-dp(root, 18), 0);
             target.intersect(band);
         }
-        // dispatchPointerEvent's x/y and getGlobalVisibleRect are both relative to this root.
+        // Gesture coordinates are normalized to this status-bar window before hit testing.
         return x >= target.left && x < target.right && y >= target.top && y < target.bottom;
     }
 
