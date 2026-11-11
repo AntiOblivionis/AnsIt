@@ -10,7 +10,8 @@
   <a href="https://ansit.tgwgroup.ltd">官方网站</a> ·
   <a href="https://ansit.tgwgroup.ltd/#download">下载安装</a> ·
   <a href="#快速开始">使用教程</a> ·
-  <a href="https://github.com/AntiOblivionis/AnsIt">GitHub</a>
+  <a href="https://github.com/AntiOblivionis/AnsIt">GitHub</a> ·
+  <a href="#支持项目">支持项目</a>
 </p>
 
 <p align="center">Android 12+ · Root + LSPosed · MIT License</p>
@@ -122,6 +123,10 @@ AnsIt 把反检测放在设计的中心：从触发、识屏到答案显示，�
 - 邮箱：[antioblivionis@gmail.com](mailto:antioblivionis@gmail.com)
 
 欢迎提交设备兼容性反馈、改进建议与 Pull Request。反馈问题时，请说明应用版本、Android / ROM 版本与复现步骤，并隐去截图、日志中的个人信息及 API Key。
+
+## 支持项目
+
+如果 AnsIt 对你有帮助，欢迎自愿[打赏支持作者](https://tgwgroup.ltd/2025/10/19/support-me/)，感谢你的支持！
 
 ## 开源协议
 
