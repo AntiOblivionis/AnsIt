@@ -7,6 +7,10 @@
 <p align="center"><strong>更安全的Android AI答题助手</strong></p>
 
 <p align="center">
+  <a href="https://ko-fi.com/J1F02AL174"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="ko-fi"></a>
+</p>
+
+<p align="center">
   <a href="https://ansit.tgwgroup.ltd">官方网站</a> ·
   <a href="https://ansit.tgwgroup.ltd/#download">下载安装</a> ·
   <a href="#快速开始">使用教程</a> ·
