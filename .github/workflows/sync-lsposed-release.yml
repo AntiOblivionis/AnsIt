@@ -1,6 +1,12 @@
 name: Sync LSPosed release
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - README.md
+      - LICENSE
+      - design/ansit-icon.svg
   release:
     types: [published, edited]
   workflow_dispatch:

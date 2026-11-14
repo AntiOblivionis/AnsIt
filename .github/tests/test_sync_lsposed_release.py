@@ -1,4 +1,5 @@
 import copy
+import base64
 from hashlib import sha256
 import importlib.util
 import json
@@ -119,9 +120,11 @@ class SyncTest(unittest.TestCase):
         target = {"id": 100, "tag_name": "17-0.9.1", "draft": False,
                   "body": sync.release_body(source), "assets": [{"name": "AnsIt-0.9.1.apk", "digest": DIGEST}]}
         with patch.dict(os.environ, {"GITHUB_REPOSITORY": sync.SOURCE, "VERIFY_ONLY": "true"}, clear=True), \
-             patch.object(sync, "all_releases", side_effect=[[source], [target]]):
+             patch.object(sync, "all_releases", side_effect=[[source], [target]]), \
+             patch.object(sync, "sync_readme_files") as sync_readme:
             sync.main()
         self.assertEqual([], self.github.writes)
+        sync_readme.assert_called_once_with(None, None, verify_only=True)
 
     def test_missing_token_never_attempts_a_write(self):
         with patch.dict(os.environ, {"GITHUB_REPOSITORY": sync.SOURCE}, clear=True):
@@ -138,7 +141,8 @@ class SyncTest(unittest.TestCase):
         self.github.releases[100] = copy.deepcopy(target)
         env = {"GITHUB_REPOSITORY": sync.SOURCE, "XPOSED_SYNC_TOKEN": "fake", "VERIFY_WRITE": "true"}
         with patch.dict(os.environ, env, clear=True), \
-             patch.object(sync, "all_releases", side_effect=[[source], [target], [target]]):
+             patch.object(sync, "all_releases", side_effect=[[source], [target], [target]]), \
+             patch.object(sync, "sync_readme_files"):
             sync.main()
         self.assertEqual(["patch"], self.github.writes)
         self.assertEqual(body, self.github.releases[100]["body"])
@@ -164,6 +168,82 @@ class SyncTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "certificate"):
                 sync.verify_signer(output)
+
+
+class ReadmeSyncTest(unittest.TestCase):
+    def setUp(self):
+        self.files = {
+            (sync.SOURCE, "README.md"): "# AnsIt\r\n中文说明\r\n".encode("utf-8"),
+            (sync.SOURCE, "LICENSE"): b"MIT license\n",
+            (sync.SOURCE, "design/ansit-icon.svg"): b"<svg></svg>\n",
+            (sync.TARGET, "README.md"): b"previous README\n",
+        }
+        self.writes = []
+        self.source_refs = []
+        self.deny_target = False
+        self.corrupt_source = False
+
+    @staticmethod
+    def blob(content):
+        return sync.sha1(b"blob " + str(len(content)).encode("ascii") + b"\0" + content).hexdigest()
+
+    def api(self, path, *, method="GET", data=None, token=None):
+        if path == f"/repos/{sync.SOURCE}/commits/main":
+            return {"sha": "a" * 40}
+        for repo in (sync.SOURCE, sync.TARGET):
+            prefix = f"/repos/{repo}/contents/"
+            if not path.startswith(prefix):
+                continue
+            name, _, query = path[len(prefix):].partition("?")
+            key = (repo, name)
+            if method == "PUT":
+                self.assertEqual("target-token", token)
+                previous = self.files.get(key)
+                self.assertEqual(self.blob(previous) if previous is not None else None, data.get("sha"))
+                self.files[key] = base64.b64decode(data["content"], validate=True)
+                self.writes.append(name)
+                return {}
+            if repo == sync.SOURCE:
+                self.source_refs.append(query)
+            if repo == sync.TARGET and self.deny_target:
+                raise sync.GitHubError(403)
+            if key not in self.files:
+                raise sync.GitHubError(404)
+            content = self.files[key]
+            sha = "0" * 40 if repo == sync.SOURCE and self.corrupt_source else self.blob(content)
+            return {"type": "file", "encoding": "base64", "size": len(content),
+                    "sha": sha, "content": base64.b64encode(content).decode("ascii")}
+        raise AssertionError(path)
+
+    def test_exact_bytes_assets_first_and_no_redundant_writes(self):
+        with patch.object(sync, "api", side_effect=self.api):
+            sync.sync_readme_files("source-token", "target-token")
+            self.assertEqual(list(sync.README_FILES), self.writes)
+            for name in sync.README_FILES:
+                self.assertEqual(self.files[(sync.SOURCE, name)], self.files[(sync.TARGET, name)])
+            self.assertTrue(all(ref == "ref=" + "a" * 40 for ref in self.source_refs))
+            sync.sync_readme_files("source-token", "target-token")
+        self.assertEqual(list(sync.README_FILES), self.writes)
+
+    def test_read_only_does_not_write_files(self):
+        with patch.object(sync, "api", side_effect=self.api):
+            sync.sync_readme_files("source-token", "target-token", verify_only=True)
+        self.assertEqual([], self.writes)
+        self.assertEqual(b"previous README\n", self.files[(sync.TARGET, "README.md")])
+
+    def test_permission_error_is_not_treated_as_a_missing_file(self):
+        self.deny_target = True
+        with patch.object(sync, "api", side_effect=self.api):
+            with self.assertRaises(sync.GitHubError):
+                sync.sync_readme_files("source-token", "target-token")
+        self.assertEqual([], self.writes)
+
+    def test_invalid_upstream_blob_is_rejected_before_writes(self):
+        self.corrupt_source = True
+        with patch.object(sync, "api", side_effect=self.api):
+            with self.assertRaisesRegex(RuntimeError, "blob hash mismatch"):
+                sync.sync_readme_files("source-token", "target-token")
+        self.assertEqual([], self.writes)
 
 
 if __name__ == "__main__":

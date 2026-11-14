@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Mirror verified public AnsIt releases into this module repository."""
 
-from hashlib import sha256
+import base64
+from hashlib import sha1, sha256
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,13 @@ SIGNER_SHA256 = "ae5e3c2a76c6f8e8c327124c96c15b9ec92f964aecec59eb5654e4918a87a24
 API = "https://api.github.com"
 UPLOADS = "https://uploads.github.com"
 MAX_APK_BYTES = 256 * 1024 * 1024
+README_FILES = ("design/ansit-icon.svg", "LICENSE", "README.md")
+
+
+class GitHubError(RuntimeError):
+    def __init__(self, status):
+        self.status = status
+        super().__init__(f"GitHub request failed with HTTP {status}")
 
 
 def request(url, *, method="GET", payload=None, token=None, content_type=None):
@@ -34,7 +42,7 @@ def request(url, *, method="GET", payload=None, token=None, content_type=None):
         with urlopen(Request(url, data=payload, headers=headers, method=method), timeout=90) as response:
             return response.read()
     except HTTPError as error:
-        raise RuntimeError(f"GitHub request failed with HTTP {error.code}") from None
+        raise GitHubError(error.code) from None
 
 
 def api(path, *, method="GET", data=None, token=None):
@@ -55,6 +63,49 @@ def all_releases(repo, token=None):
         if len(releases) < 100:
             return result
         page += 1
+
+
+def github_file(repo, path, ref, token, *, missing_ok=False):
+    try:
+        item = api(f"/repos/{repo}/contents/{quote(path, safe='/')}?ref={quote(ref, safe='')}", token=token)
+    except GitHubError as error:
+        if missing_ok and error.status == 404:
+            return None
+        raise
+    if item.get("type") != "file" or item.get("encoding") != "base64":
+        raise RuntimeError(f"Unexpected GitHub file response: {path}")
+    try:
+        content = base64.b64decode("".join(item["content"].split()), validate=True)
+    except (ValueError, KeyError):
+        raise RuntimeError(f"Invalid GitHub file content: {path}") from None
+    digest = sha1(b"blob " + str(len(content)).encode("ascii") + b"\0" + content).hexdigest()
+    if item.get("sha") != digest or item.get("size") != len(content):
+        raise RuntimeError(f"GitHub file size or blob hash mismatch: {path}")
+    return content, item["sha"]
+
+
+def sync_readme_files(source_token, target_token, *, verify_only=False):
+    commit = api(f"/repos/{SOURCE}/commits/main", token=source_token).get("sha", "")
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise RuntimeError("Cannot resolve the upstream main branch")
+    updates = []
+    for path in README_FILES:
+        source = github_file(SOURCE, path, commit, source_token)
+        target = github_file(TARGET, path, "main", target_token, missing_ok=True)
+        if target is None or source[0] != target[0]:
+            updates.append((path, source[0], target[1] if target else None))
+    for path, content, previous_sha in updates:
+        if verify_only:
+            print(f"Would sync upstream file: {path}")
+            continue
+        data = {"message": f"同步上游 {path}", "branch": "main",
+                "content": base64.b64encode(content).decode("ascii")}
+        if previous_sha:
+            data["sha"] = previous_sha
+        api(f"/repos/{TARGET}/contents/{quote(path, safe='/')}", method="PUT", data=data, token=target_token)
+        print(f"Synced upstream file: {path}")
+    if not updates:
+        print("README and referenced files already match upstream")
 
 
 def apk_asset(release):
@@ -234,6 +285,7 @@ def main():
                     print(f"Would sync verified module release: {code}-{version}")
             else:
                 sync_one(source, target_releases, target_token, Path(directory))
+    sync_readme_files(source_token, source_token if verify_only else target_token, verify_only=verify_only)
     if verify_only:
         print("Read-only verification complete")
         return
