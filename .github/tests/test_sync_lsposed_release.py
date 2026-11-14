@@ -129,6 +129,27 @@ class SyncTest(unittest.TestCase):
                 sync.main()
         self.assertEqual([], self.github.writes)
 
+    def test_write_verification_preserves_existing_release_body(self):
+        source = source_release()
+        source.update({"draft": False, "prerelease": False, "published_at": sync.FIRST_RELEASE})
+        body = sync.release_body(source)
+        target = {"id": 100, "tag_name": "17-0.9.1", "draft": False, "body": body,
+                  "assets": [{"name": "AnsIt-0.9.1.apk", "digest": DIGEST}]}
+        self.github.releases[100] = copy.deepcopy(target)
+        env = {"GITHUB_REPOSITORY": sync.SOURCE, "XPOSED_SYNC_TOKEN": "fake", "VERIFY_WRITE": "true"}
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(sync, "all_releases", side_effect=[[source], [target], [target]]):
+            sync.main()
+        self.assertEqual(["patch"], self.github.writes)
+        self.assertEqual(body, self.github.releases[100]["body"])
+
+    def test_read_only_and_write_verification_are_mutually_exclusive(self):
+        env = {"GITHUB_REPOSITORY": sync.SOURCE, "VERIFY_ONLY": "true", "VERIFY_WRITE": "true"}
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "cannot run together"):
+                sync.main()
+        self.assertEqual([], self.github.writes)
+
     def test_certificate_verifier_accepts_old_and_new_build_tools_output(self):
         for prefix in ("Signer #1", "V3.0 Signer:"):
             output = f"Number of signers: 1\n{prefix} certificate SHA-256 digest: {sync.SIGNER_SHA256}\n"

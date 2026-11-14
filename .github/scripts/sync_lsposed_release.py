@@ -206,6 +206,9 @@ def main():
         raise RuntimeError("This workflow must run in the official AnsIt repository")
     source_token = os.environ.get("GITHUB_TOKEN")
     verify_only = os.environ.get("VERIFY_ONLY", "").lower() == "true"
+    verify_write = os.environ.get("VERIFY_WRITE", "").lower() == "true"
+    if verify_only and verify_write:
+        raise RuntimeError("Read-only and write verification cannot run together")
     target_token = os.environ.get("XPOSED_SYNC_TOKEN")
     if not verify_only and not target_token:
         raise RuntimeError("Configure the XPOSED_SYNC_TOKEN Actions secret before syncing releases")
@@ -234,6 +237,17 @@ def main():
     if verify_only:
         print("Read-only verification complete")
         return
+    if verify_write:
+        if not source_releases:
+            raise RuntimeError("No published release is available for write verification")
+        latest = source_releases[-1]
+        current = find_mirrored(latest["id"], all_releases(TARGET, target_token))
+        if not current or current["draft"]:
+            raise RuntimeError("No published mirrored release is available for write verification")
+        confirm_asset(current, apk_asset(latest))
+        api(f"/repos/{TARGET}/releases/{current['id']}", method="PATCH", token=target_token,
+            data={"body": current.get("body") or ""})
+        print("Target write access verified without changing release content")
     print("Release sync complete")
 
 

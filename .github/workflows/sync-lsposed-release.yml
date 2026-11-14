@@ -9,6 +9,10 @@ on:
         description: Verify releases without writing to the module repository
         type: boolean
         default: false
+      verify_write:
+        description: Verify token write access without changing release content
+        type: boolean
+        default: false
   schedule:
     - cron: '23 * * * *'
 
@@ -36,4 +40,5 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           XPOSED_SYNC_TOKEN: ${{ secrets.XPOSED_SYNC_TOKEN }}
           VERIFY_ONLY: ${{ inputs.verify_only }}
+          VERIFY_WRITE: ${{ inputs.verify_write }}
         run: python3 .github/scripts/sync_lsposed_release.py
