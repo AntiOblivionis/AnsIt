@@ -113,7 +113,7 @@ def inspect_apk(path):
     signer = re.search(r"^Signer #1 certificate SHA-256 digest: ([0-9a-f]{64})\s*$", verification, re.M | re.I)
     if "Number of signers: 1" not in verification or not signer or signer.group(1).lower() != SIGNER_SHA256:
         details = [line for line in verification.splitlines()
-                   if line.startswith("Number of signers:") or line.startswith("Signer #1 certificate SHA-256 digest:")]
+                   if line.startswith("Number of signers:") or "sha-256" in line.lower() or "sha256" in line.lower()]
         print("APK verifier summary:", details)
         raise RuntimeError("APK signer count or certificate does not match the published AnsIt certificate")
     return match.group(2), match.group(3)
