@@ -98,6 +98,17 @@ def find_build_tool(name):
     raise RuntimeError(f"Android build tool not found: {name}")
 
 
+def verify_signer(verification):
+    digests = re.findall(
+        r"^(?:Signer #1|V\d+(?:\.\d+)? Signer:)\s+certificate SHA-256 digest:\s*([0-9a-f]{64})[ \t]*$",
+        verification, re.M | re.I,
+    )
+    if "Number of signers: 1" not in verification.splitlines() or not digests or any(
+        digest.lower() != SIGNER_SHA256 for digest in digests
+    ):
+        raise RuntimeError("APK signer count or certificate does not match the published AnsIt certificate")
+
+
 def inspect_apk(path):
     def run(arguments):
         try:
@@ -110,12 +121,7 @@ def inspect_apk(path):
     if not match or match.group(1) != PACKAGE or not re.fullmatch(r"[A-Za-z0-9._+-]{1,80}", match.group(3)):
         raise RuntimeError("APK package or version is not valid for this module")
     verification = run([find_build_tool("apksigner"), "verify", "--verbose", "--print-certs", str(path)])
-    signer = re.search(r"^Signer #1 certificate SHA-256 digest: ([0-9a-f]{64})\s*$", verification, re.M | re.I)
-    if "Number of signers: 1" not in verification or not signer or signer.group(1).lower() != SIGNER_SHA256:
-        details = [line for line in verification.splitlines()
-                   if line.startswith("Number of signers:") or "sha-256" in line.lower() or "sha256" in line.lower()]
-        print("APK verifier summary:", details)
-        raise RuntimeError("APK signer count or certificate does not match the published AnsIt certificate")
+    verify_signer(verification)
     return match.group(2), match.group(3)
 
 

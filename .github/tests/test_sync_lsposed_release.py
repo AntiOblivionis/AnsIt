@@ -129,6 +129,21 @@ class SyncTest(unittest.TestCase):
                 sync.main()
         self.assertEqual([], self.github.writes)
 
+    def test_certificate_verifier_accepts_old_and_new_build_tools_output(self):
+        for prefix in ("Signer #1", "V3.0 Signer:"):
+            output = f"Number of signers: 1\n{prefix} certificate SHA-256 digest: {sync.SIGNER_SHA256}\n"
+            sync.verify_signer(output)
+
+    def test_certificate_verifier_rejects_changed_or_multiple_signers(self):
+        unknown = "0" * 64
+        for output in (
+            f"Number of signers: 1\nV3.0 Signer: certificate SHA-256 digest: {unknown}\n",
+            f"Number of signers: 2\nSigner #1 certificate SHA-256 digest: {sync.SIGNER_SHA256}\n",
+            f"Number of signers: 1\nV2 Signer: certificate SHA-256 digest: {sync.SIGNER_SHA256}\nV3.0 Signer: certificate SHA-256 digest: {unknown}\n",
+        ):
+            with self.assertRaisesRegex(RuntimeError, "certificate"):
+                sync.verify_signer(output)
+
 
 if __name__ == "__main__":
     unittest.main()
