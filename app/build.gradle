@@ -4,9 +4,9 @@ plugins {
     id 'org.jetbrains.kotlin.plugin.compose'
 }
 android {
-    namespace 'com.antioblivionis.ansit'
+    namespace 'ltd.tgwgroup.ansit'
     compileSdk 35
-    defaultConfig { applicationId 'com.antioblivionis.ansit'; minSdk 31; targetSdk 35; versionCode 16; versionName '0.9' }
+    defaultConfig { applicationId 'ltd.tgwgroup.ansit'; minSdk 31; targetSdk 35; versionCode 17; versionName '0.9.1' }
     compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = '17' }
     buildFeatures { compose true; buildConfig true }
@@ -14,7 +14,7 @@ android {
     testOptions {
         unitTests.includeAndroidResources = true
         unitTests.all {
-            systemProperty 'ansit.renderDir', rootProject.file('artifacts/ui-0.9').absolutePath
+            systemProperty 'ansit.renderDir', rootProject.file('artifacts/ui-0.9.1').absolutePath
         }
     }
     buildTypes {
