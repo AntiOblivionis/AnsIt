@@ -207,7 +207,7 @@ def main():
                        if not release["draft"] and not release["prerelease"]
                        and release.get("published_at") and release["published_at"] >= FIRST_RELEASE]
     source_releases.sort(key=lambda release: release["published_at"])
-    target_releases = all_releases(TARGET, target_token if not verify_only else None)
+    target_releases = all_releases(TARGET, source_token if verify_only else target_token)
     with tempfile.TemporaryDirectory(prefix="ansit-release-") as directory:
         for source in source_releases:
             if verify_only:
