@@ -46,7 +46,35 @@ public class LlmConversationTest {
             assertEquals("新答案", new LlmCall().answerImage(config, "frame", null, java.util.Collections.emptyList()));
             JSONArray messages = new JSONObject(server.takeRequest().getBody().readUtf8()).getJSONArray("messages");
             assertEquals(2, messages.length());
-            assertFalse(messages.getJSONObject(0).getString("content").contains("连续答题会话"));
+            String system = messages.getJSONObject(0).getString("content");
+            assertFalse(system.contains("连续答题会话"));
+            assertTrue(system.contains("先列完所有答案，再补充说明"));
+            assertTrue(system.contains("短答案优先同行排列"));
+            assertTrue(system.contains("默认省略解析"));
+            assertTrue(system.contains("120 个汉字以内为目标"));
+            assertEquals(LlmCall.FRESH_QUESTION, messages.getJSONObject(1).getJSONArray("content")
+                .getJSONObject(0).getString("text"));
+        }
+    }
+    @Test public void customPreferencesAreSentOnlyWithTheCurrentScreenshotInBothModes() throws Exception {
+        try (MockWebServer server = new MockWebServer()) {
+            server.start();
+            ApiConfig config = new ApiConfig(server.url("/v1").toString(), KEY, "vision");
+            AnswerPromptConfig prompt = new AnswerPromptConfig("English answers\nInclude one equation");
+            for (List<JSONObject> previous : List.of(List.<JSONObject>of(), history())) {
+                server.enqueue(new MockResponse().setBody("{\"choices\":[{\"message\":{\"content\":\"18\"}}]}"));
+                assertEquals("18", new LlmCall().answer(config, SearchConfig.disabled(), "frame", previous, prompt));
+                JSONArray messages = new JSONObject(server.takeRequest().getBody().readUtf8()).getJSONArray("messages");
+                assertEquals(previous.size() + 2, messages.length());
+                for (int index = 0; index < messages.length() - 1; index++) {
+                    assertFalse(messages.getJSONObject(index).toString().contains("English answers"));
+                }
+                JSONObject current = messages.getJSONObject(messages.length() - 1);
+                assertEquals("user", current.getString("role"));
+                JSONArray parts = current.getJSONArray("content");
+                assertTrue(parts.getJSONObject(0).getString("text").endsWith("用户保存的答题偏好\n" + prompt.text()));
+                assertEquals("data:image/png;base64,frame", parts.getJSONObject(1).getJSONObject("image_url").getString("url"));
+            }
         }
     }
     @Test public void providerContextLimitBecomesContextFull() throws Exception {

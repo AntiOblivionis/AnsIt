@@ -98,7 +98,7 @@ internal fun AnsItScreen(model: MainViewModel) {
         AnsItContent(state, snackbar, model::edit, model::save, model::toggle, model::check,
             model::showGuide, model::dismissGuide, model::restartSystemUi, model::showAdjustment,
             model::editSearch, model::saveSearch, model::cancelValidation, model::editTrigger, model::saveTrigger,
-            model::editTriggerSwap)
+            model::editTriggerSwap, model::editAnswerPrompt, model::saveAnswerPrompt)
     }
 }
 
@@ -121,6 +121,8 @@ internal fun AnsItContent(
     onTriggerEdit: (String) -> Unit = {},
     onTriggerSave: () -> Unit = {},
     onTriggerSwap: (Boolean) -> Unit = {},
+    onPromptEdit: (String) -> Unit = {},
+    onPromptSave: () -> Unit = {},
 ) {
     var confirmRestart by remember { mutableStateOf(false) }
     var showAbout by rememberSaveable { mutableStateOf(false) }
@@ -169,6 +171,7 @@ internal fun AnsItContent(
                 TriggerSettingsCard(state, onTriggerEdit, onTriggerSave, onTriggerSwap)
                 ConfigurationCard(state, onEdit, onSave, onCancelValidation)
                 SearchConfigurationCard(state, onSearchEdit, onSearchSave, onCancelValidation)
+                AnswerPromptCard(state, onPromptEdit, onPromptSave)
 
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("长按状态栏，连续答题", style = MaterialTheme.typography.titleMedium)
@@ -202,6 +205,41 @@ internal fun AnsItContent(
             confirmButton = { TextButton(onClick = { confirmRestart = false; onRestart() }) { Text("重启") } },
             dismissButton = { TextButton(onClick = { confirmRestart = false }) { Text("取消") } },
         )
+    }
+}
+
+@Composable
+private fun AnswerPromptCard(state: MainState, onEdit: (String) -> Unit, onSave: () -> Unit) {
+    val enabled = !state.promptLoading && !state.promptSaving
+    val limit = AnswerPromptConfig.MAX_LENGTH
+    val tooLong = state.promptText.length > limit
+    Surface(shape = MaterialTheme.shapes.large, color = MaterialTheme.colorScheme.surfaceContainerLow) {
+        Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("答题提示词", style = MaterialTheme.typography.titleLarge)
+            Text("补充答题语言、格式或解析详略。留空使用默认提示词。",
+                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            OutlinedTextField(state.promptText, onEdit, enabled = enabled, minLines = 3, maxLines = 6,
+                label = { Text("自定义要求") },
+                placeholder = { Text("例如：英语题用英文作答，计算题只补一行关键算式。") },
+                supportingText = { Text("${state.promptText.length} / $limit") },
+                isError = tooLong, modifier = Modifier.fillMaxWidth().testTag("answer_prompt"))
+            if (state.promptReadFailed) {
+                Text("提示词读取失败，请重新保存。", style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error)
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically) {
+                if (state.promptText.isNotEmpty()) {
+                    TextButton(onClick = { onEdit("") }, enabled = enabled,
+                        modifier = Modifier.testTag("clear_answer_prompt")) { Text("清空") }
+                    Spacer(Modifier.width(8.dp))
+                }
+                FilledTonalButton(onClick = onSave, enabled = enabled && state.promptDirty && !tooLong,
+                    modifier = Modifier.testTag("save_answer_prompt")) {
+                    Text(if (state.promptSaving) "正在保存" else "保存提示词")
+                }
+            }
+        }
     }
 }
 

@@ -13,7 +13,6 @@ final class AnswerConversation {
     // context limit is the primary "full" signal and is reported the same way.
     static final int MAX_TURNS = 32;
     static final long MAX_CHARS = 20L * 1024 * 1024;
-    static final String HISTORY_PROMPT = "请解答当前截图中的主要问题，直接给出答案和必要说明。";
     private final List<JSONObject> messages = new ArrayList<>();
     private int turns;
     private long chars;
@@ -29,7 +28,7 @@ final class AnswerConversation {
     }
     synchronized void append(String base64Png, String answer) {
         try {
-            messages.add(LlmCall.imageMessage(base64Png, HISTORY_PROMPT));
+            messages.add(LlmCall.imageMessage(base64Png, LlmCall.FRESH_QUESTION));
             messages.add(LlmCall.assistantMessage(answer));
         } catch (Exception impossible) { throw new IllegalStateException("Invalid conversation message", impossible); }
         turns++;

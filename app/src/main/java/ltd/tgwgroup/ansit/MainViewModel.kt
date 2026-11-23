@@ -35,6 +35,11 @@ internal data class MainState(
     val searchSaving: Boolean = false,
     val searchCheck: String? = null,
     val searchCheckPassed: Boolean? = null,
+    val promptText: String = "",
+    val savedPromptText: String = "",
+    val promptLoading: Boolean = true,
+    val promptSaving: Boolean = false,
+    val promptReadFailed: Boolean = false,
     val operation: Operation = Operation.NONE,
     val root: RootAccess = RootAccess.UNCHECKED,
     val snapshot: RootServiceStarter.Snapshot? = null,
@@ -59,6 +64,7 @@ internal data class MainState(
 ) {
     val busy get() = operation != Operation.NONE
     val service get() = snapshot?.state ?: RootServiceStarter.State.UNKNOWN
+    val promptDirty get() = promptReadFailed || promptText != savedPromptText
 }
 internal data class UiNotice(val text: String, val saved: Boolean = false)
 
@@ -72,6 +78,7 @@ internal class MainViewModel(application: Application) : AndroidViewModel(applic
     private var savedSearch: SearchForm? = null
     private val searchFile = File(application.filesDir, SearchConfig.FILE_NAME)
     private val triggerFile = File(application.filesDir, TriggerConfig.FILE_NAME)
+    private val promptFile = File(application.filesDir, AnswerPromptConfig.FILE_NAME)
     private val checks = ConfigurationChecks()
     private var validationCall: LlmCall? = null
     private var lastControlFinished = -1L
@@ -106,6 +113,14 @@ internal class MainViewModel(application: Application) : AndroidViewModel(applic
             }
             savedSearch = search
             mutable.update { if (!it.searchDirty) it.copy(search = search) else it }
+            val prompt = withContext(Dispatchers.IO) {
+                try { AnswerPromptConfig.read(promptFile).text() }
+                catch (_: Exception) { null }
+            }
+            mutable.update {
+                it.copy(promptText = prompt.orEmpty(), savedPromptText = prompt.orEmpty(), promptLoading = false,
+                    promptReadFailed = prompt == null)
+            }
             val trigger = withContext(Dispatchers.IO) { try { TriggerConfig.read(triggerFile) } catch (_: Exception) { null } }
             mutable.update {
                 it.copy(triggerText = (trigger?.holdMillis ?: TriggerConfig.DEFAULT_MS).toString(),
@@ -120,6 +135,27 @@ internal class MainViewModel(application: Application) : AndroidViewModel(applic
     fun edit(form: ApiForm) { mutable.update { it.copy(form = form, dirty = form != savedForm, modelCheck = null, modelCheckPassed = null) } }
     fun editSearch(form: SearchForm) {
         mutable.update { it.copy(search = form, searchDirty = form != savedSearch, searchCheck = null, searchCheckPassed = null) }
+    }
+    fun editAnswerPrompt(text: String) {
+        mutable.update { if (it.promptLoading || it.promptSaving) it else it.copy(promptText = text) }
+    }
+    fun saveAnswerPrompt() {
+        val current = state.value
+        if (current.promptLoading || current.promptSaving || !current.promptDirty ||
+            current.promptText.length > AnswerPromptConfig.MAX_LENGTH) return
+        val config = AnswerPromptConfig(current.promptText)
+        mutable.update { it.copy(promptSaving = true) }
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) { PrivateSettings.write(promptFile, config.json()) }
+                mutable.update { it.copy(promptText = config.text(), savedPromptText = config.text(), promptReadFailed = false) }
+                val message = if (config.text().isEmpty()) "已恢复默认提示词，下次答题时生效"
+                    else "提示词已保存，下次答题时生效"
+                notices.send(UiNotice(message, saved = true))
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { notices.send(UiNotice("提示词保存失败，请重试")) }
+            finally { mutable.update { it.copy(promptSaving = false) } }
+        }
     }
     fun editTrigger(value: String) {
         mutable.update { it.copy(triggerText = value,

@@ -2,7 +2,10 @@ package ltd.tgwgroup.ansit
 
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.os.Looper
 import androidx.activity.ComponentActivity
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
@@ -11,12 +14,16 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performTextReplacement
+import androidx.lifecycle.ViewModelProvider
 import java.io.File
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 
@@ -55,6 +62,37 @@ class ConfigurationUiTest {
     @Test fun disabledSearchHasAnExplicitSaveOffAction() {
         compose.setContent { AnsItTheme { AnsItContent(MainState(search = SearchForm(false, "expired-key"))) } }
         compose.onNodeWithTag("search_save_check").performScrollTo().assertTextEquals("保存关闭状态").assertIsEnabled()
+    }
+    @Test fun answerPromptCanBeSavedAndClearedFromSettings() {
+        val model = compose.runOnIdle { ViewModelProvider(compose.activity)[MainViewModel::class.java] }
+        val file = File(compose.activity.application.filesDir, AnswerPromptConfig.FILE_NAME)
+        fun awaitSettings(condition: () -> Boolean) = compose.waitUntil(5_000) {
+            shadowOf(Looper.getMainLooper()).idle()
+            condition()
+        }
+        compose.setContent {
+            val state by model.state.collectAsState()
+            AnsItTheme { AnsItContent(state.copy(showGuide = false),
+                onPromptEdit = model::editAnswerPrompt, onPromptSave = model::saveAnswerPrompt) }
+        }
+        awaitSettings { !model.state.value.promptLoading }
+        compose.onNodeWithTag("save_answer_prompt").performScrollTo().assertIsNotEnabled()
+        val field = compose.onNodeWithTag("answer_prompt")
+        field.performScrollTo().performTextReplacement("字".repeat(AnswerPromptConfig.MAX_LENGTH + 1))
+        compose.onNodeWithTag("save_answer_prompt").performScrollTo().assertIsNotEnabled()
+
+        val preference = "用英文作答\n保留关键算式"
+        field.performScrollTo().performTextReplacement(preference)
+        compose.onNodeWithTag("save_answer_prompt").performScrollTo().assertIsEnabled().performClick()
+        awaitSettings { model.state.value.savedPromptText == preference && !model.state.value.promptSaving }
+        assertEquals(preference, AnswerPromptConfig.read(file).text())
+
+        compose.onNodeWithTag("clear_answer_prompt").performScrollTo().performClick()
+        // Robolectric's AtomicFile delegates to host File.renameTo, which cannot replace a file on Windows.
+        if (File.separatorChar == '\\') assertTrue(file.delete())
+        compose.onNodeWithTag("save_answer_prompt").assertIsEnabled().performClick()
+        awaitSettings { model.state.value.savedPromptText.isEmpty() && !model.state.value.promptSaving }
+        assertEquals(AnswerPromptConfig.DEFAULT, AnswerPromptConfig.read(file))
     }
     private fun render(name: String) {
         val directory = System.getProperty("ansit.renderDir") ?: return

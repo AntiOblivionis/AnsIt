@@ -424,6 +424,9 @@ public final class RootMain {
                 SearchConfig search;
                 try { search = SearchConfig.read(new java.io.File(CONFIG_DIR, SearchConfig.FILE_NAME)); }
                 catch (Exception invalidSearch) { search = SearchConfig.disabled(); }
+                AnswerPromptConfig prompt;
+                try { prompt = AnswerPromptConfig.read(new java.io.File(CONFIG_DIR, AnswerPromptConfig.FILE_NAME)); }
+                catch (Exception invalidPrompt) { prompt = AnswerPromptConfig.DEFAULT; }
                 synchronized (RootMain.class) { if (!active || generation.get() != request) return; }
                 bitmap = capture();
                 String base64 = LlmCall.encodePng(bitmap);
@@ -441,7 +444,7 @@ public final class RootMain {
                     history = keepContext ? conversation.snapshot() : Collections.emptyList();
                     System.out.println("REQUEST " + request + (keepContext ? " context" : " fresh"));
                 }
-                String result = api.answer(config, search, base64, history);
+                String result = api.answer(config, search, base64, history, prompt);
                 synchronized (RootMain.class) {
                     if (active && generation.get() == request) {
                         conversation.append(base64, result);
