@@ -9,6 +9,8 @@ import android.view.View;
 import android.view.ViewConfiguration;
 import java.lang.reflect.Method;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.ExecutorService;
@@ -27,11 +29,8 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
     private final WeakHashMap<View, Gesture> gestures = new WeakHashMap<>();
     private final Set<View> pendingAttach = Collections.newSetFromMap(new WeakHashMap<>());
     private final Set<View> attachedSources = Collections.newSetFromMap(new WeakHashMap<>());
+    private final Map<StatusBarTap.Touch, StatusBarTap> scrollTaps = new HashMap<>();
     private final ExecutorService io = Executors.newSingleThreadExecutor();
-    // Readiness refreshes these before every tap is classified; the root validates them again.
-    private volatile String serviceInstance;
-    private volatile boolean continuous;
-    private volatile long modeToken;
     private static volatile long lastFiredDownTime = Long.MIN_VALUE;
     @Override public void handleLoadPackage(XC_LoadPackage.LoadPackageParam p) {
         if (!p.packageName.equals("com.android.systemui") || !p.processName.equals(p.packageName)) return;
@@ -40,9 +39,53 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
                 XposedBridge.log("AnsIt: no supported status bar view");
                 return;
             }
+            installHyperOsScrollGuard(p.classLoader);
             XposedBridge.log("AnsIt: status bar touch trigger installed");
             HookStatus.start(loadedApk);
         } catch (Throwable t) { XposedBridge.log(t); }
+    }
+
+    private void installHyperOsScrollGuard(ClassLoader loader) {
+        try {
+            Class<?> listener = XposedHelpers.findClassIfExists(
+                "com.android.systemui.statusbar.gesture.StatusBarLongPressGestureDetector$gestureDetector$1", loader);
+            if (listener == null) return;
+            Method single = listener.getDeclaredMethod("onSingleTapConfirmed", MotionEvent.class);
+            Method doubleTap = listener.getDeclaredMethod("onDoubleTapEvent", MotionEvent.class);
+            XC_MethodHook guard = new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    if (Looper.myLooper() != Looper.getMainLooper()) return;
+                    MotionEvent event = (MotionEvent) param.args[0];
+                    StatusBarTap tap = scrollTaps.get(touch(event));
+                    if (tap == null || tap.scrollAllowed()) return;
+                    if (tap.awaitsScrollDecision()) {
+                        MotionEvent copy = MotionEvent.obtain(event);
+                        Object receiver = param.thisObject;
+                        Method method = (Method) param.method;
+                        tap.deferScroll(allow -> {
+                            try {
+                                if (allow) XposedBridge.invokeOriginalMethod(method, receiver, new Object[]{copy});
+                            } catch (Throwable error) {
+                                XposedBridge.log("AnsIt: status bar scroll callback failed: " + error.getClass().getSimpleName());
+                            } finally { copy.recycle(); }
+                        });
+                    }
+                    // HyperOS can request the same double-tap scroll on DOWN and UP. Handle it
+                    // once, after classification, without touching the status bar's event stream.
+                    param.setResult(true);
+                }
+            };
+            XposedBridge.hookMethod(single, guard);
+            XposedBridge.hookMethod(doubleTap, guard);
+            XposedBridge.log("AnsIt: HyperOS status bar scroll guard installed");
+        } catch (Throwable unavailable) {
+            XposedBridge.log("AnsIt: status bar scroll guard unavailable ("
+                + unavailable.getClass().getSimpleName() + ")");
+        }
+    }
+
+    private static StatusBarTap.Touch touch(MotionEvent event) {
+        return new StatusBarTap.Touch(event.getDeviceId(), event.getSource(), event.getDownTime());
     }
 
     /**
@@ -160,12 +203,11 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
         final Handler handler = new Handler(Looper.getMainLooper());
         final HoldState state = new HoldState();
         final TriggerGate gate = HookStatus.gate();
-        boolean secondTap;
-        boolean moved;
-        boolean tapEligible;
-        boolean tapPending;
+        StatusBarTap downTap;
+        StatusBarTap pendingTap;
+        StatusBarTap firstOfDoubleTap;
+        boolean detached;
         long firstTapUpAt;
-        float tapX, tapY;
         float x, y;
         final Runnable hold = this::onHold;
         final Runnable singleTap = this::fireSingleTap;
@@ -174,7 +216,9 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
             root.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
                 @Override public void onViewAttachedToWindow(View v) { }
                 @Override public void onViewDetachedFromWindow(View v) {
-                    reset(); handler.removeCallbacks(singleTap); tapPending = false;
+                    detached = true;
+                    reset(); handler.removeCallbacks(singleTap);
+                    resolveTap(pendingTap, false); pendingTap = null;
                     gestures.remove(v); v.removeOnAttachStateChangeListener(this);
                 }
             });
@@ -186,8 +230,7 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
         private void onHold() {
             HoldState.Attempt attempt = state.current();
             if (attempt == null) return;
-            moved = true;
-            secondTap = false;
+            cancelDownTap();
             if (!StatusBarTarget.hit(root, x, y) || locked() || !gate.allowed(attempt.gateRevision, attempt.instance)) { reset(); return; }
             if (!state.requestConfirmation(attempt, SystemClock.uptimeMillis())) return;
             io.execute(() -> {
@@ -208,28 +251,54 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
         int slop() { return ViewConfiguration.get(root.getContext()).getScaledTouchSlop(); }
         int doubleTapTimeout() { return ViewConfiguration.get(root.getContext()).getDoubleTapTimeout(); }
         boolean secondTapCandidate(MotionEvent event) {
-            return tapPending && SystemClock.uptimeMillis() - firstTapUpAt <= doubleTapTimeout()
-                && Math.hypot(event.getX() - tapX, event.getY() - tapY) <= slop()
-                && !locked() && StatusBarTarget.hit(root, event.getX(), event.getY());
+            return pendingTap != null && !pendingTap.scrollAllowed()
+                && pendingTap.touch.deviceId() == event.getDeviceId() && pendingTap.touch.source() == event.getSource()
+                && event.getEventTime() - firstTapUpAt <= doubleTapTimeout()
+                && Math.hypot(event.getX() - pendingTap.x, event.getY() - pendingTap.y) <= slop();
         }
-        void scheduleSingleTap() {
-            tapPending = true;
-            firstTapUpAt = SystemClock.uptimeMillis();
-            tapX = x; tapY = y;
-            handler.removeCallbacks(singleTap);
+        void scheduleSingleTap(StatusBarTap tap, long upAt) {
+            if (pendingTap != null) fireSingleTap();
+            pendingTap = tap;
+            firstTapUpAt = upAt;
             handler.postDelayed(singleTap, doubleTapTimeout());
         }
         void fireSingleTap() {
-            tapPending = false;
-            sendNext(false);
+            handler.removeCallbacks(singleTap);
+            StatusBarTap tap = pendingTap;
+            pendingTap = null;
+            if (tap != null) selectTap(tap, null);
         }
-        void fireDoubleTap() {
-            sendNext(true);
+        void selectTap(StatusBarTap tap, StatusBarTap first) {
+            // Preparation for both contacts is queued in touch order on the same worker.
+            // Queue the decision behind them if the last contact's result is still in flight.
+            if (tap.prepared) {
+                finishTap(tap, first);
+                return;
+            }
+            io.execute(() -> handler.post(() -> finishTap(tap, first)));
         }
-        void sendNext(boolean doubleTap) {
-            String instance = serviceInstance;
-            long token = modeToken;
-            if (continuous && instance != null && token > 0) io.execute(() -> TriggerClient.next(instance, token, doubleTap));
+        void finishTap(StatusBarTap tap, StatusBarTap first) {
+            boolean claim = !detached && tap.active(gate) && !locked() && root.isShown()
+                && (first == null || tap.sharesMode(first, gate));
+            resolveTap(first, claim);
+            resolveTap(tap, claim);
+            if (claim) {
+                TriggerProtocol.Ready ready = tap.ready;
+                io.execute(() -> {
+                    if (gate.allowed(tap.gateRevision, ready.instance()))
+                        TriggerClient.next(ready.instance(), ready.modeToken(), first != null);
+                });
+            }
+        }
+        void resolveTap(StatusBarTap tap, boolean claim) {
+            if (tap == null) return;
+            tap.resolve(claim);
+            if (tap.scrollAllowed()) scrollTaps.remove(tap.touch, tap);
+            else handler.postDelayed(() -> scrollTaps.remove(tap.touch, tap), doubleTapTimeout());
+        }
+        void cancelDownTap() {
+            resolveTap(downTap, false); downTap = null;
+            resolveTap(firstOfDoubleTap, false); firstOfDoubleTap = null;
         }
         boolean accept(MotionEvent event) {
             int action = event.getActionMasked();
@@ -237,27 +306,24 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
                 // A duplicated delivery of the same touch (two status bar view instances or a relayed
                 // event) must not start a second session and immediately toggle the first one off.
                 if (event.getDownTime() == lastFiredDownTime) return true;
-                boolean second = secondTapCandidate(event);
                 reset();
-                moved = false;
-                if (second) {
-                    handler.removeCallbacks(singleTap);
-                    tapPending = false;
-                    secondTap = true;
-                }
                 if (locked() || !StatusBarTarget.hit(root, event.getX(), event.getY())) return false;
-                tapEligible = true;
+                if (secondTapCandidate(event)) {
+                    handler.removeCallbacks(singleTap);
+                    firstOfDoubleTap = pendingTap;
+                    pendingTap = null;
+                }
                 x = event.getX(); y = event.getY();
                 HoldState.Attempt attempt = state.begin(event.getDownTime(), gate.revision());
+                StatusBarTap tap = new StatusBarTap(touch(event), x, y, attempt.gateRevision);
+                downTap = tap;
+                scrollTaps.put(tap.touch, tap);
                 io.execute(() -> {
-                    // Refresh readiness even when the finger left early: taps still need the mode token.
                     TriggerProtocol.Ready ready = TriggerClient.prepare();
-                    if (ready != null) {
-                        serviceInstance = ready.instance();
-                        continuous = ready.mode();
-                        modeToken = ready.modeToken();
-                    }
                     handler.post(() -> {
+                        tap.ready = ready;
+                        tap.prepared = true;
+                        if (!tap.active(gate)) resolveTap(tap, false);
                         if (!state.live(attempt)) return;
                         if (ready == null || !root.isShown() || locked()
                             || !gate.allowed(attempt.gateRevision, ready.instance()) || !state.arm(attempt, ready)) {
@@ -270,7 +336,6 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
             }
             if (!state.fired() && (action == MotionEvent.ACTION_MOVE || action == MotionEvent.ACTION_POINTER_DOWN)) {
                 if (event.getPointerCount() != 1 || Math.hypot(event.getX() - x, event.getY() - y) > slop()) {
-                    moved = true;
                     reset();
                 }
             }
@@ -280,17 +345,21 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
                 handler.removeCallbacks(hold);
                 if (release.instance() != null) {
                     lastFiredDownTime = event.getDownTime();
-                    secondTap = false;
                     io.execute(() -> {
                         if (gate.allowed(release.gateRevision(), release.instance())) TriggerClient.toggle(release.instance());
                     });
-                } else if (action == MotionEvent.ACTION_UP && tapEligible && !moved) {
-                    if (secondTap) {
-                        secondTap = false;
-                        fireDoubleTap();
+                } else if (action == MotionEvent.ACTION_UP && downTap != null && downTap.touch.equals(touch(event))
+                    && Math.hypot(event.getX() - x, event.getY() - y) <= slop()
+                    && StatusBarTarget.hit(root, event.getX(), event.getY()) && !locked()) {
+                    if (firstOfDoubleTap != null) {
+                        selectTap(downTap, firstOfDoubleTap);
                     } else {
-                        scheduleSingleTap();
+                        scheduleSingleTap(downTap, event.getEventTime());
                     }
+                    downTap = null;
+                    firstOfDoubleTap = null;
+                } else {
+                    cancelDownTap();
                 }
             }
             return consume;
@@ -298,8 +367,7 @@ public final class TriggerHook implements IXposedHookLoadPackage, IXposedHookZyg
         void reset() {
             handler.removeCallbacks(hold);
             state.cancel();
-            secondTap = false;
-            tapEligible = false;
+            cancelDownTap();
         }
     }
 }
