@@ -81,6 +81,8 @@ public final class RootMain {
         if (args.length == 2 && args[0].equals("manage")) {
             if (android.os.Process.myUid() != 0) throw new SecurityException("Root required");
             if (args[1].equals("inspect")) { printInspection(); return; }
+            TriggerProtocol.UriAction uriAction = TriggerProtocol.UriAction.fromArgument(args[1]);
+            if (uriAction != null) { triggerFromUri(uriAction); return; }
             if (args[1].equals("stop")) {
                 try { control("STOP"); } catch (java.io.IOException absent) { if (!isAbsent(absent)) throw absent; }
                 for (int attempt = 0; attempt < 30 && serviceRunning(); attempt++) Thread.sleep(100);
@@ -189,6 +191,10 @@ public final class RootMain {
                         boolean accepted = next != null && next.instance().equals(serviceInstance)
                             && nextTurn(next.doubleTap(), next.modeToken());
                         client.getOutputStream().write((accepted ? "OK\n" : "IGNORED\n").getBytes(StandardCharsets.UTF_8));
+                    } else if (uid == 0 && (TriggerProtocol.UriAction.NEXT.socketCommand.equals(cmd)
+                        || TriggerProtocol.UriAction.NEXT_CONTEXT.socketCommand.equals(cmd))) {
+                        boolean keepContext = TriggerProtocol.UriAction.NEXT_CONTEXT.socketCommand.equals(cmd);
+                        client.getOutputStream().write((nextFromUri(keepContext) + "\n").getBytes(StandardCharsets.UTF_8));
                     } else if ("TOGGLE".equals(cmd) || (cmd != null && cmd.startsWith("TOGGLE "))) {
                         boolean accepted = !stopping && ("TOGGLE".equals(cmd) || TriggerProtocol.current(cmd, "TOGGLE ", serviceInstance));
                         if (accepted) toggle();
@@ -250,6 +256,23 @@ public final class RootMain {
         if (stopping) return false;
         try { DisplayState now = displayState(); return now.state == 2 && !now.locked; }
         catch (Exception unavailable) { return false; }
+    }
+
+    private static void triggerFromUri(TriggerProtocol.UriAction action) throws Exception {
+        try {
+            if (action != TriggerProtocol.UriAction.TOGGLE) {
+                String reply = control(action.socketCommand);
+                System.out.println(reply == null ? TriggerProtocol.UNAVAILABLE : reply);
+                return;
+            }
+            // Use the same readiness and service instance checks as the status bar gesture.
+            TriggerProtocol.Ready ready = TriggerProtocol.parseReady(control(TriggerProtocol.PREPARE));
+            boolean accepted = ready != null && "OK".equals(control("TOGGLE " + ready.instance()));
+            System.out.println(accepted ? TriggerProtocol.URI_TRIGGERED : TriggerProtocol.UNAVAILABLE);
+        } catch (java.io.IOException absent) {
+            if (!isAbsent(absent)) throw absent;
+            System.out.println("ANSIT_SERVICE_STOPPED");
+        }
     }
 
     private static void revokeTrigger() {
@@ -399,20 +422,32 @@ public final class RootMain {
             if (!triggerReady()) return false;
             config = TriggerConfig.read(new java.io.File(CONFIG_DIR, TriggerConfig.FILE_NAME));
         } catch (Exception unavailable) { return false; }
-        boolean keepContext = config.swapTaps ? !doubleTap : doubleTap;
+        enqueueNext(config.swapTaps ? !doubleTap : doubleTap);
+        return true;
+    }
+
+    private static synchronized String nextFromUri(boolean keepContext) {
+        if (!triggerReady()) return TriggerProtocol.UNAVAILABLE;
+        if (!active) return TriggerProtocol.URI_NEEDS_SESSION;
+        if (pendingTask != null) return TriggerProtocol.URI_ANSWER_PENDING;
+        enqueueNext(keepContext);
+        return TriggerProtocol.URI_TRIGGERED;
+    }
+
+    /** Called with the RootMain monitor held after checking service and session readiness. */
+    private static void enqueueNext(boolean keepContext) {
         if (keepContext && (conversation.full() || conversation.limitReached())) {
             conversation.markFull();
             try {
                 show("上下文已满", displayedOn.width, displayedOn.height);
                 System.out.println("CONTEXT_FULL " + modeToken);
             } catch (Exception drawing) { cancel(); }
-            return true;
+            return;
         }
         long request = generation.incrementAndGet();
         if (!keepContext) conversation.reset();
         runTurn(request, keepContext);
         System.out.println("NEXT " + (keepContext ? "context " : "fresh ") + request);
-        return true;
     }
 
     private static void runTurn(long request, boolean keepContext) {

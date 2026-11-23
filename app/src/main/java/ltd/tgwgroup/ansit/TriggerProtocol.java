@@ -6,6 +6,28 @@ final class TriggerProtocol {
     static final String UNAVAILABLE = "ANSIT_TRIGGER_UNAVAILABLE";
     static final String READY = "ANSIT_TRIGGER_READY";
     static final String NEXT = "TRIGGER_NEXT";
+    static final String URI_TRIGGERED = "ANSIT_URI_TRIGGERED";
+    static final String URI_NEEDS_SESSION = "ANSIT_URI_NEEDS_SESSION";
+    static final String URI_ANSWER_PENDING = "ANSIT_URI_ANSWER_PENDING";
+
+    enum UriAction {
+        TOGGLE("trigger", null),
+        NEXT("next", "TRIGGER_URI_NEXT"),
+        NEXT_CONTEXT("next-context", "TRIGGER_URI_NEXT_CONTEXT");
+
+        final String argument;
+        final String socketCommand;
+
+        UriAction(String argument, String socketCommand) {
+            this.argument = argument;
+            this.socketCommand = socketCommand;
+        }
+
+        static UriAction fromArgument(String argument) {
+            for (UriAction action : values()) if (action.argument.equals(argument)) return action;
+            return null;
+        }
+    }
     /**
      * Readiness also carries the active continuous-mode generation, if any. A stopped, old or
      * malformed service never arms a gesture, so both ends must agree on this exact packet.

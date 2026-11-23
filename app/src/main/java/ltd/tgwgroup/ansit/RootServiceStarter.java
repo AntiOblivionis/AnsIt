@@ -43,6 +43,21 @@ public final class RootServiceStarter {
         Result result = execute(installedApk, "manage stop", 20);
         if (parseState(result.output, result.exitCode) != State.STOPPED) throw new IOException("服务未确认停止，请重试");
     }
+    static void triggerUri(String installedApk, TriggerProtocol.UriAction action) throws IOException, InterruptedException {
+        Result result = execute(installedApk, "manage " + action.argument, 10);
+        if (result.exitCode == 0) {
+            if (hasLine(result.output, TriggerProtocol.URI_TRIGGERED)) return;
+            if (hasLine(result.output, "ANSIT_SERVICE_STOPPED"))
+                throw new IOException("请先在 AnsIt 启动答题服务");
+            if (hasLine(result.output, TriggerProtocol.URI_NEEDS_SESSION))
+                throw new IOException("请先进入连续答题再切题");
+            if (hasLine(result.output, TriggerProtocol.URI_ANSWER_PENDING))
+                throw new IOException("当前答案正在生成，请稍后切题");
+            if (hasLine(result.output, TriggerProtocol.UNAVAILABLE))
+                throw new IOException("请解锁屏幕，并确认 AnsIt 的答题服务已就绪");
+        }
+        throw new IOException("无法触发答题，请在 AnsIt 检查服务和 Root 授权");
+    }
     static void refreshOverlay(String installedApk) throws Exception {
         Result result = execute(installedApk, "refresh-overlay", 20);
         if (result.exitCode != 0 || !(hasLine(result.output, "ANSIT_OVERLAY_APPLIED") || hasLine(result.output, "ANSIT_OVERLAY_SAVED")))
@@ -86,7 +101,7 @@ public final class RootServiceStarter {
         for (String line : output.split("\\R")) if (line.equals(expected)) return true;
         return false;
     }
-    private static Result execute(String installedApk, String arguments, int timeout) throws Exception {
+    private static Result execute(String installedApk, String arguments, int timeout) throws IOException, InterruptedException {
         String command = "CLASSPATH=" + quote(installedApk)
             + " /system/bin/app_process /system/bin " + RootMain.class.getName() + " " + arguments;
         Process root = new ProcessBuilder("su", "-c", command).redirectErrorStream(true).start();
